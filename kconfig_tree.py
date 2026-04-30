@@ -406,18 +406,32 @@ def build_knode_index(node: KNode,
 _DOC_SYMBOL_RE = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
 # Matches trailing comment, preceded by single space
 _TRAILING_CMT  = re.compile(r" (#.*)$")
-# Matches structural header content prefixes
-_STRUCT_PREFIX = re.compile(r"^(▶|◆|---|---|\[if )")
+# Structural leader prefixes — stripped before anchor key storage/lookup
+_STRUCT_LEADER = re.compile(r"^(▶ |◆ |--- |─── |\[if )")
+
+
+def _normalise_anchor(content: str) -> str:
+    """Strip structural leader (▶ /◆ /--- ) and trailing comment from content."""
+    # Strip trailing comment first
+    m = _TRAILING_CMT.search(content)
+    if m:
+        content = content[: m.start()]
+    # Strip structural leader
+    content = _STRUCT_LEADER.sub("", content, count=1)
+    # Strip closing --- from Kconfig comment markers  "--- Foo ---"
+    content = re.sub(r"\s*---\s*$", "", content)
+    return content.strip()
 
 
 @dataclass
 class DocEntry:
     raw_line: str           # as stored in file (plain, no ANSI)
     symbol: str             # CONFIG_FOO, or "" for structural/comment lines
-    anchor_key: str         # symbol for config lines; menu prompt for structural
+    anchor_key: str         # symbol for config lines; prompt for structural
     trailing_comment: str   # "# …" preserved from this line, or ""
     attached_comments: list[str] = field(default_factory=list)
     is_pure_comment: bool = False
+    is_bare_symbol: bool = False  # user wrote just "CONFIG_FOO" on a line
 
 
 def _parse_doc_line(line: str) -> DocEntry:
@@ -438,6 +452,12 @@ def _parse_doc_line(line: str) -> DocEntry:
     else:
         content_clean = content
 
+    # Bare CONFIG_ symbol line — user added just the symbol name
+    bare = content_clean.strip()
+    if re.fullmatch(r"CONFIG_\w+", bare):
+        return DocEntry(raw_line=line, symbol=bare, anchor_key=bare,
+                        trailing_comment=trailing, is_bare_symbol=True)
+
     # Config/menuconfig line: has (SYMBOL_NAME) tag
     symbol = ""
     anchor_key = ""
@@ -446,8 +466,8 @@ def _parse_doc_line(line: str) -> DocEntry:
         symbol = f"CONFIG_{ms.group(1)}"
         anchor_key = symbol
     else:
-        # Structural line: use trimmed content as anchor
-        anchor_key = content_clean.strip()
+        # Structural line: normalise away leader chars before storing anchor
+        anchor_key = _normalise_anchor(content_clean)
 
     return DocEntry(raw_line=line, symbol=symbol, anchor_key=anchor_key,
                     trailing_comment=trailing)
@@ -650,6 +670,30 @@ class Merger:
             return True
         return False
 
+    def _maybe_notice_untracked(self, node: KNode):
+        """
+        Fire a notice when we are skipping a node that is active and in neither
+        file.  Called only when _should_emit returned False.
+        Only fires for leaf config/menuconfig that are themselves active
+        (not merely a container whose children happen to be tracked).
+        """
+        sym = node.symbol()
+        if not sym:
+            return
+        if self._in_doc(sym) or self._in_sup(sym):
+            return
+        if not node.is_active():
+            return
+        # Suppress noise: if every active child of a menuconfig is already
+        # tracked in the doc, the parent itself being untracked is not useful.
+        if node.kind == "menuconfig":
+            if any(self._in_doc(c.symbol()) for c in node.children if c.symbol()):
+                return
+        self.notices.append(
+            f"Active option not in doc or suppressed: {sym} "
+            f"(use --add-new-enabled or --add-new to include)"
+        )
+
     def _has_visible_children(self, node: KNode) -> bool:
         for child in node.children:
             if child.kind in ("config", "menuconfig"):
@@ -668,6 +712,8 @@ class Merger:
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
                     out.append(child)
+                else:
+                    self._maybe_notice_untracked(child)
             elif child.kind in ("menu", "choice", "if"):
                 if self._has_visible_children(child):
                     out.append(child)
@@ -696,38 +742,13 @@ class Merger:
             # Suppressed file unchanged
             self.new_sup_entries = list(self.sup_entries)
 
-        # Collect notices for symbols in neither file
-        self._collect_untracked_notices()
-
         # Check for conflicts (in both doc and suppressed)
         self._check_conflicts()
 
-        # Walk the tree
+        # Walk the tree (notices for untracked symbols fire inside _emit_child)
         self._recurse(self.root, prefix="", depth=0)
 
         return self.output
-
-    def _collect_untracked_notices(self):
-        """
-        For every symbol in the Kconfig tree that is in neither doc nor
-        suppressed, emit a notice suggesting how to add it.
-        """
-        self._walk_untracked(self.root)
-
-    def _walk_untracked(self, node: KNode):
-        sym = node.symbol()
-        if sym and not self._in_doc(sym) and not self._in_sup(sym):
-            if not self.full and not self.add_new:
-                if node.is_active():
-                    if not self.add_new_en:
-                        self.notices.append(
-                            f"Active option not in doc: {sym} "
-                            f"(use --add-new-enabled or --add-new to include)")
-                else:
-                    if not self.add_new and not self.add_new_en:
-                        pass  # silent for inactive — too noisy
-        for c in node.children:
-            self._walk_untracked(c)
 
     def _check_conflicts(self):
         """Warn about and resolve symbols present in both doc and suppressed."""
@@ -761,7 +782,8 @@ class Merger:
             sk = self._struct_key(node)
             if sk not in self._emitted:
                 self._emitted.add(sk)
-                # Use menu prompt as anchor key for trailing comment lookup
+                # Anchor key is the normalised prompt — matches how parse_doc
+                # stores structural lines (leader and trailing comment stripped)
                 anchor = node.prompt.strip() if node.prompt else ""
                 trailing = ""
                 attached = []
@@ -786,9 +808,16 @@ class Merger:
         in_doc = self._in_doc(sym)
         in_sup = self._in_sup(sym)
 
-        # Determine which trailing comment / attached comments to use.
-        # If being newly added via --add-new* or --full (not in doc yet),
-        # check suppressed for preserved comments.
+        # Check if this was a bare-symbol entry — notice the resolution
+        if in_doc:
+            doc_entry = self.doc_entries[self.doc_index[sym]]
+            if doc_entry.is_bare_symbol:
+                notice_p = f"# ~ Bare symbol resolved: {sym}"
+                notice_c = cyan(notice_p)
+                self._push(notice_p, notice_c, is_notice=True)
+                self.notices.append(f"Bare symbol resolved and placed: {sym}")
+
+        # Determine trailing comment / attached comments
         if in_doc:
             trailing = self._doc_trailing(sym)
             attached = self._doc_comments(sym)
@@ -869,10 +898,6 @@ def compute_new_suppressed(
 
 
 # ── Emit Linux .config format ─────────────────────────────────────────────────
-
-# Reuse _DOC_SYMBOL_RE for extracting symbols from output lines
-_DOC_SYMBOL_RE = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
-
 
 def emit_kconfig_format(output_lines: list[OutputLine],
                         knode_index: dict[str, KNode]):
