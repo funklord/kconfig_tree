@@ -7,49 +7,60 @@ tracking which are active and merging updates across kernel versions.
 
 THREE-FILE MODEL
 ────────────────
-  .config                   Kernel truth  (what is active)
-  kconfig_doc.txt           User's allowlist  (what to show and document)
-  kconfig_doc_suppressed.txt  User's denylist  (what to permanently hide)
+  .config                     Kernel truth (what is active)
+  kconfig_doc.txt             User allowlist (what to show and document)
+  kconfig_doc_suppressed.txt  User denylist (what to permanently hide)
 
 MERGE RULES (per symbol, every run)
 ────────────────────────────────────
-  In doc                         → emit, update glyph
-  In suppressed                  → never emit (unless --full)
-  In neither, inactive           → silent, notify user to use --add-new
-  In neither, active             → notify user to use --add-new-enabled
-  In both (conflict)             → doc wins, warn, remove from suppressed
-  --add-new                      → adds all symbols in neither file to doc
-  --add-new-enabled              → adds only [*]/[M] symbols in neither to doc
-  --full                         → merges suppressed→doc, adds all remaining
+  In doc                    → emit, update glyph, warn on value mismatch
+  In suppressed             → never emit (unless --full)
+  In neither, inactive      → silent
+  In neither, active        → notice on stderr (suggest --add-new-enabled)
+  In both (conflict)        → doc wins, warn, remove from suppressed
+  --add-new                 → add all symbols in neither file
+  --add-new-enabled         → add only [*]/[M] symbols in neither file
+  --full                    → merge suppressed→doc, add all remaining
+
+INPUT FORMATS ACCEPTED IN DOC / SUPPRESSED FILES
+─────────────────────────────────────────────────
+  Full doc format:   ├─ [*] Some prompt (SYMBOL_NAME) # optional comment
+  Bare symbol:       CONFIG_SYMBOL_NAME  # optional comment
+  .config format:    CONFIG_SYMBOL=y  or  # CONFIG_SYMBOL is not set
+  Pure comment:      # free text
+
+All formats are normalised to full doc format on next write.
+
+COMMENT ANCHORING
+─────────────────
+  option A
+  # comment 1    ← anchored below: attached to option A
+  # comment 2    ← anchored to comment 1 (same group)
+                 ← blank line breaks chain
+  # comment 3    ← blank above + option directly below → pre-anchored to B
+  # comment 4    ← same group as comment 3
+  option B
+                 ← blank line
+  # comment 5    ← blank above, no option below → freestanding (attached above)
+  # comment 6    ← same group as comment 5
+
+ORPHAN SPACING
+──────────────
+  Whenever two consecutive entries would imply a parent-child relationship
+  that doesn't exist in the Kconfig tree, a blank line is inserted between
+  them so the tree structure cannot be visually misread.
 
 USAGE
 ─────
-  # First run — populate doc with all active options
-  python3 kconfig_tree.py --add-new-enabled
-
-  # First run — populate doc with everything
-  python3 kconfig_tree.py --full
-
-  # Normal update run (update values, respect suppressions)
-  python3 kconfig_tree.py
-
-  # View the tree with colours
-  python3 kconfig_tree.py --show
-
-  # After kernel upgrade — add newly appeared active options
-  python3 kconfig_tree.py --add-new-enabled
-
-  # Suppress an active option permanently
-  #   Move its line from kconfig_doc.txt to kconfig_doc_suppressed.txt
-
-  # Un-suppress an option
-  #   Delete its line from kconfig_doc_suppressed.txt
-
-  # Re-add everything, clearing suppression
-  python3 kconfig_tree.py --full
-
-  # Emit a .config-format file
+  python3 kconfig_tree.py --add-new-enabled   # first run, active options only
+  python3 kconfig_tree.py --full              # first run, everything
+  python3 kconfig_tree.py                     # normal update
+  python3 kconfig_tree.py --show              # view coloured tree
+  python3 kconfig_tree.py --add-new-enabled   # after kernel upgrade
   python3 kconfig_tree.py --emit-kconfig > my.config
+
+  Suppress an option:   move its line from doc → suppressed file
+  Un-suppress:          delete its line from suppressed file
 
 OPTIONS
 ───────
@@ -58,8 +69,8 @@ OPTIONS
   --doc        PATH   Doc file                      (default: kconfig_doc.txt)
   --suppressed PATH   Suppressed file               (default: kconfig_doc_suppressed.txt)
   --arch       ARCH   Architecture                  (default: arm64)
-  --add-new           Add all symbols absent from both files to doc
-  --add-new-enabled   Add only active symbols absent from both files to doc
+  --add-new           Add all symbols in neither file to doc
+  --add-new-enabled   Add only active symbols in neither file to doc
   --full              Restore suppressed + add all remaining symbols
   --emit-kconfig      Print Linux .config format to stdout, then exit
   --show              Show coloured tree on stdout
@@ -89,14 +100,12 @@ def cyan(t):    return _c("36", t)
 def gray(t):    return _c("90", t)
 def bold(t):    return _c("1",  t)
 def magenta(t): return _c("35", t)
-def red(t):     return _c("31", t)
 
 ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 def strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
-# ── Tree characters ────────────────────────────────────────────────────────────
-# Single-line box, single space, no trailing space.
+# ── Tree drawing ───────────────────────────────────────────────────────────────
 
 PIPE  = "│ "
 TEE   = "├─ "
@@ -106,15 +115,13 @@ BLANK = "  "
 _TREE_CHARS = set("│├└─ ")
 
 def _strip_tree_prefix(line: str) -> tuple[str, str]:
-    """Split off leading tree-drawing characters. Returns (prefix, content)."""
     i = 0
     while i < len(line) and line[i] in _TREE_CHARS:
         i += 1
     return line[:i], line[i:]
 
-def _depth_of(line: str) -> int:
-    """Approximate depth from prefix width. PIPE/BLANK unit = 2 chars."""
-    prefix, _ = _strip_tree_prefix(line)
+def _depth_of(plain: str) -> int:
+    prefix, _ = _strip_tree_prefix(plain)
     return len(prefix) // 2
 
 
@@ -126,13 +133,12 @@ class KNode:
     name: str         # symbol name without CONFIG_ prefix, or ""
     prompt: str = ""
     type_: str = ""
-    help_: str = ""
     depends: str = ""
     children: list = field(default_factory=list)
     parent: Optional["KNode"] = field(default=None, repr=False)
     file: str = ""
     lineno: int = 0
-    value: Optional[str] = None
+    value: Optional[str] = None   # filled from .config
 
     def symbol(self) -> str:
         return f"CONFIG_{self.name}" if self.name else ""
@@ -142,11 +148,6 @@ class KNode:
             return False
         v = self.value.strip().strip('"')
         return v not in ("", "n", "0")
-
-    def any_descendant_active(self) -> bool:
-        if self.is_active():
-            return True
-        return any(c.any_descendant_active() for c in self.children)
 
     def raw_glyph(self) -> str:
         if self.kind in ("menu", "choice", "comment", "if"):
@@ -169,6 +170,16 @@ class KNode:
         if v == "m":        return yellow("[M]")
         if v in ("n", ""):  return gray("[ ]")
         return cyan(f"[={v}]")
+
+    def ancestry(self) -> list["KNode"]:
+        """Return list of ancestors from root down to (not including) self."""
+        chain: list[KNode] = []
+        p = self.parent
+        while p:
+            chain.append(p)
+            p = p.parent
+        chain.reverse()
+        return chain
 
 
 # ── Kconfig parser ─────────────────────────────────────────────────────────────
@@ -222,7 +233,8 @@ class KconfigParser:
             lines = path.read_text(errors="replace").splitlines()
         except OSError:
             parent.children.append(
-                KNode(kind="comment", name="", prompt=f"[missing: {path}]"))
+                KNode(kind="comment", name="",
+                      prompt=f"[missing: {path}]"))
             return
         self._parse_lines(lines, path, parent)
 
@@ -244,8 +256,6 @@ class KconfigParser:
                 stripped = line.lstrip()
                 indent = len(line) - len(stripped)
                 if stripped == "" or indent > help_indent:
-                    if cur_node:
-                        cur_node.help_ += line + "\n"
                     continue
                 in_help = False
 
@@ -394,165 +404,330 @@ def build_knode_index(node: KNode,
     return idx
 
 
-# ── Doc-file parser ────────────────────────────────────────────────────────────
+# ── Doc / suppressed file parser ───────────────────────────────────────────────
 #
-# Symbols are tagged as  (SYMBOL_NAME)  in config/menuconfig lines.
-# Structural lines (menu/choice/if) are identified by their content prefix:
-#   ▶  for menu, ◆ for choice, --- for Kconfig comment, [ for if-block.
-# Trailing comments (#…) are preserved on all line types.
-# Pure comment lines (content starts with #) are anchored to the entry above.
+# Accepts four input formats per line:
+#   1. Full doc:     ├─ [*] Some prompt (SYMBOL) # comment
+#   2. Bare symbol:  CONFIG_SYMBOL  # comment
+#   3. .config set:  CONFIG_SYMBOL=value
+#   4. .config unset: # CONFIG_SYMBOL is not set
+#   5. Pure comment: # free text
+#
+# Comment anchoring (resolved after all lines are parsed):
+#   - A comment block directly below an option/menu → anchored below
+#     (attached to the option above it, emitted after it)
+#   - A comment block with a blank line above AND an option directly below
+#     → anchored above (pre-comment of the option below, emitted before it)
+#   - A comment block with blank above and nothing/blank below → freestanding,
+#     attached to option above as trailing group
 
-# Matches the (SYMBOL_NAME) tag in a config line
-_DOC_SYMBOL_RE = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
-# Matches trailing comment, preceded by single space
-_TRAILING_CMT  = re.compile(r" (#.*)$")
-# Structural leader prefixes — stripped before anchor key storage/lookup
-_STRUCT_LEADER = re.compile(r"^(▶ |◆ |--- |─── |\[if )")
-
-
-def _normalise_anchor(content: str) -> str:
-    """Strip structural leader (▶ /◆ /--- ) and trailing comment from content."""
-    # Strip trailing comment first
-    m = _TRAILING_CMT.search(content)
-    if m:
-        content = content[: m.start()]
-    # Strip structural leader
-    content = _STRUCT_LEADER.sub("", content, count=1)
-    # Strip closing --- from Kconfig comment markers  "--- Foo ---"
-    content = re.sub(r"\s*---\s*$", "", content)
-    return content.strip()
+_DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
+_TRAILING_CMT_RE = re.compile(r" (#.*)$")
+_BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
+_DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
+_DOTCFG_UNSET_RE = re.compile(r"^#\s+(CONFIG_\w+)\s+is not set\s*$")
+_STRUCT_LEADER   = re.compile(r"^(▶ |◆ |\[if )")
+_KCONFIG_CMT_RE  = re.compile(r"^--- (.+) ---$")
 
 
 @dataclass
-class DocEntry:
-    raw_line: str           # as stored in file (plain, no ANSI)
-    symbol: str             # CONFIG_FOO, or "" for structural/comment lines
-    anchor_key: str         # symbol for config lines; prompt for structural
-    trailing_comment: str   # "# …" preserved from this line, or ""
-    attached_comments: list[str] = field(default_factory=list)
+class RawEntry:
+    """One logical item parsed from a doc/suppressed file, before anchoring."""
+    symbol: str           # CONFIG_FOO or ""
+    trailing_comment: str # "# …" on same line as option, or ""
+    file_value: str       # value from =y/.config format, or ""
     is_pure_comment: bool = False
-    is_bare_symbol: bool = False  # user wrote just "CONFIG_FOO" on a line
+    comment_text: str = ""  # content of pure comment line(s)
+    blank_before: bool = False  # was there a blank line before this entry?
+    # Filled after anchoring:
+    pre_comments:  list[str] = field(default_factory=list)  # comment lines before
+    post_comments: list[str] = field(default_factory=list)  # comment lines after
 
 
-def _parse_doc_line(line: str) -> DocEntry:
-    """Parse one non-empty, non-blank line from a doc file."""
-    _prefix, content = _strip_tree_prefix(line)
-
-    # Pure comment?
-    if content.startswith("#"):
-        return DocEntry(raw_line=line, symbol="", anchor_key="",
-                        trailing_comment="", is_pure_comment=True)
-
-    # Extract trailing comment
-    trailing = ""
-    m = _TRAILING_CMT.search(content)
+def _extract_symbol_from_doc_line(content_clean: str) -> str:
+    """Try to extract CONFIG_SYMBOL from full doc format (SYMBOL) tag."""
+    m = _DOC_SYMBOL_RE.search(content_clean)
     if m:
-        trailing = m.group(1)
-        content_clean = content[: m.start()]
-    else:
-        content_clean = content
-
-    # Bare CONFIG_ symbol line — user added just the symbol name
-    bare = content_clean.strip()
-    if re.fullmatch(r"CONFIG_\w+", bare):
-        return DocEntry(raw_line=line, symbol=bare, anchor_key=bare,
-                        trailing_comment=trailing, is_bare_symbol=True)
-
-    # Config/menuconfig line: has (SYMBOL_NAME) tag
-    symbol = ""
-    anchor_key = ""
-    ms = _DOC_SYMBOL_RE.search(content_clean)
-    if ms:
-        symbol = f"CONFIG_{ms.group(1)}"
-        anchor_key = symbol
-    else:
-        # Structural line: normalise away leader chars before storing anchor
-        anchor_key = _normalise_anchor(content_clean)
-
-    return DocEntry(raw_line=line, symbol=symbol, anchor_key=anchor_key,
-                    trailing_comment=trailing)
+        return f"CONFIG_{m.group(1)}"
+    return ""
 
 
-def parse_doc(path: Path) -> tuple[list[DocEntry], dict[str, int]]:
+def _extract_trailing(content: str) -> tuple[str, str]:
+    """Return (content_without_trailing, trailing_comment)."""
+    m = _TRAILING_CMT_RE.search(content)
+    if m:
+        return content[:m.start()], m.group(1)
+    return content, ""
+
+
+def _struct_prompt_key(content_clean: str) -> str:
+    """Normalise structural line content to a lookup key (strip leader/closer)."""
+    s = _STRUCT_LEADER.sub("", content_clean, count=1)
+    s = _KCONFIG_CMT_RE.sub(r"\1", s)
+    return s.strip()
+
+
+class DocFileParser:
     """
-    Returns (entries, index) where index maps anchor_key → entry index.
-    Pure comment lines are attached to the nearest preceding non-comment entry.
+    Parses a doc or suppressed file into RawEntry objects, resolves comment
+    anchoring, and returns:
+      symbol_index:  CONFIG_FOO → RawEntry
+      struct_index:  normalised_prompt → RawEntry  (for structural lines)
+      ordered:       list[RawEntry] in file order (non-comment entries)
     """
-    entries: list[DocEntry] = []
-    index: dict[str, int] = {}
 
-    if not path.exists():
-        return entries, index
+    def __init__(self, path: Path, knode_index: dict[str, KNode]):
+        self.path = path
+        self.knode_index = knode_index
+        self.symbol_index: dict[str, RawEntry] = {}
+        self.struct_index: dict[str, RawEntry] = {}
+        self.ordered: list[RawEntry] = []
+        self.warnings: list[str] = []
+        self._parse()
 
-    for raw in path.read_text(errors="replace").splitlines():
-        line = strip_ansi(raw).rstrip()
-        if not line:
-            continue
+    def _parse(self):
+        if not self.path.exists():
+            return
 
-        entry = _parse_doc_line(line)
+        raw_lines = self.path.read_text(errors="replace").splitlines()
 
-        if entry.is_pure_comment:
-            # Attach to last non-comment entry
-            for e in reversed(entries):
-                if not e.is_pure_comment:
-                    e.attached_comments.append(line)
-                    break
-            else:
-                entries.append(entry)
-            continue
+        # ── Pass 1: classify every line ───────────────────────────────────────
+        # Items: ("option", RawEntry) | ("comment", str) | ("blank",)
 
-        entries.append(entry)
-        if entry.anchor_key and entry.anchor_key not in index:
-            index[entry.anchor_key] = len(entries) - 1
+        items: list[tuple] = []
+        for raw in raw_lines:
+            line = strip_ansi(raw).rstrip()
 
-    return entries, index
+            if not line:
+                items.append(("blank",))
+                continue
+
+            # Check for .config unset format first (starts with #)
+            m = _DOTCFG_UNSET_RE.match(line)
+            if m:
+                sym = m.group(1)
+                entry = RawEntry(symbol=sym, trailing_comment="",
+                                 file_value="n")
+                items.append(("option", entry))
+                continue
+
+            _prefix, content = _strip_tree_prefix(line)
+
+            # Pure comment (not .config unset)
+            if content.startswith("#"):
+                items.append(("comment", content))
+                continue
+
+            content_clean, trailing = _extract_trailing(content)
+            content_clean = content_clean.strip()
+
+            # .config set format: CONFIG_FOO=value
+            m = _DOTCFG_SET_RE.match(content_clean)
+            if m:
+                sym, val = m.group(1), m.group(2)
+                entry = RawEntry(symbol=sym, trailing_comment=trailing,
+                                 file_value=val)
+                items.append(("option", entry))
+                continue
+
+            # Bare symbol: CONFIG_FOO (with no = sign, no (NAME) tag)
+            m = _BARE_SYMBOL_RE.match(content_clean)
+            if m and not _DOC_SYMBOL_RE.search(content_clean):
+                sym = m.group(1)
+                entry = RawEntry(symbol=sym, trailing_comment=trailing,
+                                 file_value="")
+                items.append(("option", entry))
+                continue
+
+            # Full doc format with (SYMBOL) tag
+            sym = _extract_symbol_from_doc_line(content_clean)
+            if sym:
+                entry = RawEntry(symbol=sym, trailing_comment=trailing,
+                                 file_value="")
+                items.append(("option", entry))
+                continue
+
+            # Structural line (menu/choice/if/kconfig-comment) — no symbol
+            prompt_key = _struct_prompt_key(content_clean)
+            if prompt_key:
+                entry = RawEntry(symbol="", trailing_comment=trailing,
+                                 file_value="", comment_text=prompt_key)
+                items.append(("option", entry))
+                continue
+
+            # Unrecognised non-blank non-comment line — treat as freestanding comment
+            items.append(("comment", content))
+
+        # ── Pass 2: resolve comment anchoring ────────────────────────────────
+        # Walk items, collecting comment runs and deciding where to attach them.
+
+        n = len(items)
+        i = 0
+        option_entries: list[RawEntry] = []  # in file order
+
+        while i < n:
+            kind = items[i][0]
+
+            if kind == "blank":
+                i += 1
+                continue
+
+            if kind == "option":
+                entry = items[i][1]
+                entry.blank_before = (i > 0 and items[i-1][0] == "blank")
+                option_entries.append(entry)
+                i += 1
+                continue
+
+            if kind == "comment":
+                # Collect contiguous comment lines
+                cmt_lines: list[str] = []
+                while i < n and items[i][0] == "comment":
+                    cmt_lines.append(items[i][1])
+                    i += 1
+
+                blank_above = (len(option_entries) == 0 or
+                               (i - len(cmt_lines) > 0 and
+                                items[i - len(cmt_lines) - 1][0] == "blank"))
+
+                # Is there an option immediately after (no blank)?
+                next_is_option = (i < n and items[i][0] == "option")
+
+                if blank_above and next_is_option:
+                    # Pre-anchor: attach to the option below
+                    # We defer: mark with a sentinel and resolve after
+                    # collecting the next option
+                    # Simplest: peek ahead and attach now
+                    next_entry = items[i][1]
+                    next_entry.pre_comments = cmt_lines
+                elif option_entries:
+                    # Post-anchor or freestanding: attach to option above
+                    option_entries[-1].post_comments.extend(cmt_lines)
+                # else: comments before any option — will be prepended to first
+                continue
+
+        # ── Pass 3: index entries ─────────────────────────────────────────────
+
+        for entry in option_entries:
+            if entry.symbol:
+                if entry.symbol not in self.symbol_index:
+                    self.symbol_index[entry.symbol] = entry
+                    self.ordered.append(entry)
+                else:
+                    self.warnings.append(
+                        f"Duplicate symbol {entry.symbol} in "
+                        f"{self.path.name} — keeping first occurrence")
+            elif entry.comment_text:
+                # Structural entry — key by prompt
+                key = entry.comment_text
+                if key not in self.struct_index:
+                    self.struct_index[key] = entry
+                    self.ordered.append(entry)
+            # Pure structural with no key: discard (was unrecognised)
+
+        # ── Pass 4: validate symbols against Kconfig tree ─────────────────────
+        bad = []
+        for sym in list(self.symbol_index.keys()):
+            if sym not in self.knode_index:
+                self.warnings.append(
+                    f"Symbol {sym} in {self.path.name} not found in "
+                    f"Kconfig tree — line removed")
+                del self.symbol_index[sym]
+                self.ordered = [e for e in self.ordered if e.symbol != sym]
+
+        # ── Pass 5: value mismatch warnings ───────────────────────────────────
+        for sym, entry in self.symbol_index.items():
+            if not entry.file_value:
+                continue
+            node = self.knode_index.get(sym)
+            if node is None:
+                continue
+            live = (node.value or "").strip()
+            fv   = entry.file_value.strip().strip('"')
+            live_s = live.strip('"')
+            if fv != live_s and fv not in ("", "n") and live_s not in ("", "n"):
+                self.warnings.append(
+                    f"Value mismatch for {sym}: "
+                    f"file has ={fv}, .config has ={live_s} — using .config value")
+
+
+# ── Ancestry helpers ──────────────────────────────────────────────────────────
+
+def _shared_ancestor_depth(a: KNode, b: KNode) -> int:
+    """How many ancestors do a and b share (from root)?"""
+    aa = [id(n) for n in a.ancestry()] + [id(a)]
+    bb = set([id(n) for n in b.ancestry()] + [id(b)])
+    count = 0
+    for aid in aa:
+        if aid in bb:
+            count += 1
+    return count
+
+
+def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
+    """
+    Return True if a blank line should be inserted before curr_node because
+    its parent-child relationship with prev_node would be ambiguous.
+    Two nodes need a blank when they share no structural parent closer than
+    the root, i.e. they come from completely different subtrees.
+    """
+    if prev_node is None:
+        return False
+    prev_anc = set(id(n) for n in prev_node.ancestry())
+    curr_anc = set(id(n) for n in curr_node.ancestry())
+    # If they share an ancestor other than root (depth > 1 shared), no blank.
+    shared = prev_anc & curr_anc
+    # Remove root (always shared); if nothing else shared → blank
+    # The root has no parent, so we identify it by parent == None
+    non_root_shared = [n for n in prev_node.ancestry() + curr_node.ancestry()
+                       if id(n) in shared and n.parent is not None]
+    return len(non_root_shared) == 0
 
 
 # ── Line renderers ─────────────────────────────────────────────────────────────
 
-def _body(node: KNode) -> tuple[str, str]:
-    """Return (plain_body, coloured_body) without prefix/connector/comment."""
-    glyph_p = node.raw_glyph()
-    glyph_c = node.coloured_glyph()
+def _plain_body(node: KNode) -> str:
+    glyph = node.raw_glyph()
+    if node.kind == "menu":
+        return f"▶ {node.prompt}" if node.prompt else "▶ (menu)"
+    if node.kind == "choice":
+        return f"◆ {node.prompt or '(choice)'}"
+    if node.kind == "comment":
+        return f"--- {node.prompt} ---"
+    if node.kind == "if":
+        return f"[{node.prompt}]"
+    prompt  = node.prompt or node.name
+    tag     = f" ({node.name})" if node.name else ""
+    return f"{glyph} {prompt}{tag}" if glyph else f"{prompt}{tag}"
 
+
+def _colour_body(node: KNode) -> str:
+    glyph = node.coloured_glyph()
     if node.kind == "menu":
         p = f"▶ {node.prompt}" if node.prompt else "▶ (menu)"
-        c = bold(cyan(p))
-    elif node.kind == "choice":
-        p = f"◆ {node.prompt or '(choice)'}"
-        c = bold(p)
-    elif node.kind == "comment":
-        p = f"--- {node.prompt} ---"
-        c = gray(p)
-    elif node.kind == "if":
-        p = f"[{node.prompt}]"
-        c = gray(p)
-    else:
-        prompt = node.prompt or node.name
-        tag_p  = f" ({node.name})" if node.name else ""
-        tag_c  = gray(f" ({node.name})") if node.name else ""
-        if glyph_p:
-            p = f"{glyph_p} {prompt}{tag_p}"
-            c = f"{glyph_c} {bold(prompt) if node.is_active() else gray(prompt)}{tag_c}"
-        else:
-            p = f"{prompt}{tag_p}"
-            c = f"{bold(prompt) if node.is_active() else gray(prompt)}{tag_c}"
-
-    return p, c
+        return bold(cyan(p))
+    if node.kind == "choice":
+        return bold(f"◆ {node.prompt or '(choice)'}")
+    if node.kind == "comment":
+        return gray(f"--- {node.prompt} ---")
+    if node.kind == "if":
+        return gray(f"[{node.prompt}]")
+    prompt  = node.prompt or node.name
+    pstr    = bold(prompt) if node.is_active() else gray(prompt)
+    tag     = gray(f" ({node.name})") if node.name else ""
+    return f"{glyph} {pstr}{tag}" if glyph else f"{pstr}{tag}"
 
 
 def _plain_line(node: KNode, prefix: str, connector: str,
                 trailing: str = "") -> str:
-    body_p, _ = _body(node)
     tc = f" {trailing}" if trailing else ""
-    return f"{prefix}{connector}{body_p}{tc}"
+    return f"{prefix}{connector}{_plain_body(node)}{tc}"
 
 
 def _colour_line(node: KNode, prefix: str, connector: str,
                  trailing: str = "") -> str:
-    _, body_c = _body(node)
     tc = f" {gray(trailing)}" if trailing else ""
-    return f"{prefix}{connector}{body_c}{tc}"
+    return f"{prefix}{connector}{_colour_body(node)}{tc}"
 
 
 # ── OutputLine ─────────────────────────────────────────────────────────────────
@@ -561,59 +736,57 @@ def _colour_line(node: KNode, prefix: str, connector: str,
 class OutputLine:
     plain:      str
     coloured:   str
-    symbol:     str  = ""   # CONFIG_FOO or "" — for --emit-kconfig lookup
+    symbol:     str  = ""
+    is_blank:   bool = False
     is_notice:  bool = False
     is_warning: bool = False
+
+
+def _blank() -> OutputLine:
+    return OutputLine(plain="", coloured="", is_blank=True)
 
 
 # ── Merger ─────────────────────────────────────────────────────────────────────
 
 class Merger:
-    """
-    Walks the Kconfig tree and produces OutputLines using the three-file model.
-
-    Per symbol:
-      in doc                         → emit, update glyph
-      in suppressed                  → skip (unless --full)
-      in neither, inactive           → skip, notify (suggest --add-new)
-      in neither, active             → skip, notify (suggest --add-new-enabled)
-      in both (conflict)             → doc wins, warn
-      --add-new                      → add inactive+active symbols in neither
-      --add-new-enabled              → add only active symbols in neither
-      --full                         → merge suppressed→doc, add all remaining
-    """
-
     def __init__(
         self,
         root:         KNode,
-        doc_entries:  list[DocEntry],
-        doc_index:    dict[str, int],
-        sup_entries:  list[DocEntry],
-        sup_index:    dict[str, int],
+        doc:          DocFileParser,
+        sup:          DocFileParser,
         knode_index:  dict[str, KNode],
         add_new:      bool = False,
         add_new_en:   bool = False,
         full:         bool = False,
     ):
         self.root        = root
-        self.doc_entries = doc_entries
-        self.doc_index   = doc_index
-        self.sup_entries = sup_entries
-        self.sup_index   = sup_index
+        self.doc         = doc
+        self.sup         = sup
         self.knode_index = knode_index
         self.add_new     = add_new
         self.add_new_en  = add_new_en
         self.full        = full
 
         self.output:   list[OutputLine] = []
-        self.notices:  list[str] = []    # informational messages
-        self.warnings: list[str] = []    # conflict warnings
+        self.notices:  list[str] = []
+        self.warnings: list[str] = list(doc.warnings) + list(sup.warnings)
 
-        # What goes into the new suppressed file after this run
-        # (used by --full to clear it, otherwise preserved as-is)
-        self.new_sup_entries: list[DocEntry] = []
+        self._emitted:  set[str] = set()   # emitted CONFIG_ symbols
+        self._struct_emitted: set[int] = set()  # id(KNode) for structural
 
-        self._emitted: set[str] = set()  # CONFIG_FOO or __struct_<id>
+        # Effective doc set: for --full, merge suppressed into doc first
+        self._eff_doc:    dict[str, RawEntry] = dict(doc.symbol_index)
+        self._eff_struct: dict[str, RawEntry] = dict(doc.struct_index)
+        if full:
+            for sym, entry in sup.symbol_index.items():
+                if sym not in self._eff_doc:
+                    self._eff_doc[sym] = entry
+                    self.notices.append(f"Restored from suppressed: {sym}")
+            for key, entry in sup.struct_index.items():
+                if key not in self._eff_struct:
+                    self._eff_struct[key] = entry
+
+        self._prev_knode: Optional[KNode] = None  # for orphan blank detection
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -623,76 +796,79 @@ class Merger:
                                       symbol=symbol, is_notice=is_notice,
                                       is_warning=is_warning))
 
-    def _in_doc(self, key: str) -> bool:
-        return bool(key) and key in self.doc_index
+    def _push_blank(self):
+        # Avoid double blanks
+        if self.output and not self.output[-1].is_blank:
+            self.output.append(_blank())
 
-    def _in_sup(self, key: str) -> bool:
-        return bool(key) and key in self.sup_index
+    def _in_eff_doc(self, sym: str) -> bool:
+        return sym in self._eff_doc
 
-    def _doc_trailing(self, key: str) -> str:
-        if not self._in_doc(key):
-            return ""
-        return self.doc_entries[self.doc_index[key]].trailing_comment
-
-    def _doc_comments(self, key: str) -> list[str]:
-        if not self._in_doc(key):
-            return []
-        return self.doc_entries[self.doc_index[key]].attached_comments
-
-    def _sup_trailing(self, key: str) -> str:
-        if not self._in_sup(key):
-            return ""
-        return self.sup_entries[self.sup_index[key]].trailing_comment
-
-    def _sup_comments(self, key: str) -> list[str]:
-        if not self._in_sup(key):
-            return []
-        return self.sup_entries[self.sup_index[key]].attached_comments
-
-    def _struct_key(self, node: KNode) -> str:
-        return f"__struct_{id(node)}"
-
-    # ── decision for a config/menuconfig node ─────────────────────────────────
+    def _in_sup(self, sym: str) -> bool:
+        return sym in self.sup.symbol_index
 
     def _should_emit(self, node: KNode) -> bool:
-        """Should this config/menuconfig node appear in the output?"""
         sym = node.symbol()
         if self.full:
             return True
-        if self._in_doc(sym):
+        if self._in_eff_doc(sym):
             return True
         if self._in_sup(sym):
             return False
-        # In neither file
         if self.add_new:
             return True
         if self.add_new_en and node.is_active():
             return True
         return False
 
-    def _maybe_notice_untracked(self, node: KNode):
-        """
-        Fire a notice when we are skipping a node that is active and in neither
-        file.  Called only when _should_emit returned False.
-        Only fires for leaf config/menuconfig that are themselves active
-        (not merely a container whose children happen to be tracked).
-        """
-        sym = node.symbol()
-        if not sym:
-            return
-        if self._in_doc(sym) or self._in_sup(sym):
-            return
-        if not node.is_active():
-            return
-        # Suppress noise: if every active child of a menuconfig is already
-        # tracked in the doc, the parent itself being untracked is not useful.
-        if node.kind == "menuconfig":
-            if any(self._in_doc(c.symbol()) for c in node.children if c.symbol()):
-                return
-        self.notices.append(
-            f"Active option not in doc or suppressed: {sym} "
-            f"(use --add-new-enabled or --add-new to include)"
-        )
+    def _get_trailing(self, sym: str) -> str:
+        e = self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
+        return e.trailing_comment if e else ""
+
+    def _get_pre_comments(self, sym: str) -> list[str]:
+        e = self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
+        return e.pre_comments if e else []
+
+    def _get_post_comments(self, sym: str) -> list[str]:
+        e = self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
+        return e.post_comments if e else []
+
+    def _get_struct_trailing(self, key: str) -> str:
+        e = self._eff_struct.get(key) or self.sup.struct_index.get(key)
+        return e.trailing_comment if e else ""
+
+    def _get_struct_pre(self, key: str) -> list[str]:
+        e = self._eff_struct.get(key) or self.sup.struct_index.get(key)
+        return e.pre_comments if e else []
+
+    def _get_struct_post(self, key: str) -> list[str]:
+        e = self._eff_struct.get(key) or self.sup.struct_index.get(key)
+        return e.post_comments if e else []
+
+    def _emit_comments(self, lines: list[str], prefix: str):
+        for cmt in lines:
+            self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
+
+    def _maybe_blank(self, curr_node: KNode):
+        """Insert blank if curr_node and prev_node have unrelated ancestry."""
+        if _needs_blank(self._prev_knode, curr_node):
+            self._push_blank()
+
+    # ── tree walk ──────────────────────────────────────────────────────────────
+
+    def run(self) -> list[OutputLine]:
+        hdr = f"⚙ {self.root.prompt or 'Linux Kernel Configuration'}"
+        self._push(hdr, bold(cyan(hdr)))
+        self._check_conflicts()
+        self._recurse(self.root, prefix="", depth=0)
+        return self.output
+
+    def _check_conflicts(self):
+        for sym in self.doc.symbol_index:
+            if sym in self.sup.symbol_index:
+                msg = (f"Conflict: {sym} in both doc and suppressed "
+                       f"— doc wins, removing from suppressed")
+                self.warnings.append(msg)
 
     def _has_visible_children(self, node: KNode) -> bool:
         for child in node.children:
@@ -713,7 +889,22 @@ class Merger:
                 if self._should_emit(child):
                     out.append(child)
                 else:
-                    self._maybe_notice_untracked(child)
+                    # Notice for active options in neither file
+                    sym = child.symbol()
+                    if (child.is_active()
+                            and not self._in_eff_doc(sym)
+                            and not self._in_sup(sym)
+                            and not self.add_new
+                            and not self.add_new_en
+                            and not self.full):
+                        # Only notice leaf-active, not menuconfig containers
+                        # whose children are already tracked
+                        if child.kind != "menuconfig" or not any(
+                                self._in_eff_doc(c.symbol())
+                                for c in child.children if c.symbol()):
+                            self.notices.append(
+                                f"Active option not tracked: {sym} "
+                                f"(use --add-new-enabled or --add-new)")
             elif child.kind in ("menu", "choice", "if"):
                 if self._has_visible_children(child):
                     out.append(child)
@@ -721,179 +912,98 @@ class Merger:
                 out.append(child)
         return out
 
-    # ── run ────────────────────────────────────────────────────────────────────
-
-    def run(self) -> list[OutputLine]:
-        hdr = f"⚙ {self.root.prompt or 'Linux Kernel Configuration'}"
-        self._push(hdr, bold(cyan(hdr)))
-
-        # If --full, seed suppressed entries back into the doc index so they
-        # are treated as "in doc"
-        if self.full:
-            for entry in self.sup_entries:
-                if entry.is_pure_comment or not entry.anchor_key:
-                    continue
-                if entry.anchor_key not in self.doc_index:
-                    self.doc_entries.append(entry)
-                    self.doc_index[entry.anchor_key] = len(self.doc_entries) - 1
-            # Suppressed file will be written empty
-            self.new_sup_entries = []
-        else:
-            # Suppressed file unchanged
-            self.new_sup_entries = list(self.sup_entries)
-
-        # Check for conflicts (in both doc and suppressed)
-        self._check_conflicts()
-
-        # Walk the tree (notices for untracked symbols fire inside _emit_child)
-        self._recurse(self.root, prefix="", depth=0)
-
-        return self.output
-
-    def _check_conflicts(self):
-        """Warn about and resolve symbols present in both doc and suppressed."""
-        for sym, didx in self.doc_index.items():
-            if sym in self.sup_index:
-                msg = (f"Conflict: {sym} is in both doc and suppressed files "
-                       f"— doc wins; removing from suppressed")
-                self.warnings.append(msg)
-                # Remove from new_sup_entries
-                self.new_sup_entries = [
-                    e for e in self.new_sup_entries
-                    if e.anchor_key != sym
-                ]
-
-    # ── recursive tree walk ────────────────────────────────────────────────────
-
     def _recurse(self, parent: KNode, prefix: str, depth: int):
         children = self._visible_children(parent)
         for idx, child in enumerate(children):
-            is_last   = (idx == len(children) - 1)
+            is_last   = idx == len(children) - 1
             connector = LAST if is_last else TEE
             child_pfx = prefix + (BLANK if is_last else PIPE)
-            self._emit_child(child, prefix, connector, child_pfx, depth)
+            self._emit_child(child, prefix, connector, child_pfx)
 
     def _emit_child(self, node: KNode, prefix: str, connector: str,
-                    child_pfx: str, depth: int):
-        sym = node.symbol()
+                    child_pfx: str):
 
-        # ── structural nodes ───────────────────────────────────────────────────
+        # ── structural ─────────────────────────────────────────────────────────
         if node.kind in ("menu", "choice", "if", "comment"):
-            sk = self._struct_key(node)
-            if sk not in self._emitted:
-                self._emitted.add(sk)
-                # Anchor key is the normalised prompt — matches how parse_doc
-                # stores structural lines (leader and trailing comment stripped)
-                anchor = node.prompt.strip() if node.prompt else ""
-                trailing = ""
-                attached = []
-                if anchor and self._in_doc(anchor):
-                    trailing = self._doc_trailing(anchor)
-                    attached = self._doc_comments(anchor)
-                p = _plain_line(node, prefix, connector, trailing)
-                c = _colour_line(node, prefix, connector, trailing)
-                self._push(p, c)
-                for cmt in attached:
-                    _, content = _strip_tree_prefix(cmt)
-                    self._push(f"{child_pfx}{content}",
-                               f"{child_pfx}{gray(content)}")
-            self._recurse(node, child_pfx, depth + 1)
+            nid = id(node)
+            if nid in self._struct_emitted:
+                self._recurse(node, child_pfx, 0)
+                return
+            self._struct_emitted.add(nid)
+
+            self._maybe_blank(node)
+            key      = node.prompt.strip() if node.prompt else ""
+            trailing = self._get_struct_trailing(key)
+
+            for cmt in self._get_struct_pre(key):
+                self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
+
+            p = _plain_line(node, prefix, connector, trailing)
+            c = _colour_line(node, prefix, connector, trailing)
+            self._push(p, c)
+
+            for cmt in self._get_struct_post(key):
+                self._push(f"{child_pfx}{cmt}", f"{child_pfx}{gray(cmt)}")
+
+            self._prev_knode = node
+            self._recurse(node, child_pfx, 0)
             return
 
         # ── config / menuconfig ────────────────────────────────────────────────
+        sym = node.symbol()
         if sym in self._emitted:
             return
         self._emitted.add(sym)
 
-        in_doc = self._in_doc(sym)
+        self._maybe_blank(node)
+
+        in_eff = self._in_eff_doc(sym)
         in_sup = self._in_sup(sym)
 
-        # Check if this was a bare-symbol entry — notice the resolution
-        if in_doc:
-            doc_entry = self.doc_entries[self.doc_index[sym]]
-            if doc_entry.is_bare_symbol:
-                notice_p = f"# ~ Bare symbol resolved: {sym}"
-                notice_c = cyan(notice_p)
-                self._push(notice_p, notice_c, is_notice=True)
-                self.notices.append(f"Bare symbol resolved and placed: {sym}")
-
-        # Determine trailing comment / attached comments
-        if in_doc:
-            trailing = self._doc_trailing(sym)
-            attached = self._doc_comments(sym)
-        elif in_sup and self.full:
-            trailing = self._sup_trailing(sym)
-            attached = self._sup_comments(sym)
-        else:
-            trailing = ""
-            attached = []
-
-        # Notice if this is a newly added symbol (in neither originally)
-        if not in_doc and not in_sup and (self.add_new or self.add_new_en or self.full):
+        # Notices for newly added symbols
+        if not in_eff and not in_sup and (
+                self.add_new or self.add_new_en or self.full):
             notice_p = f"# + New option added to doc: {sym}"
-            notice_c = green(notice_p)
-            self._push(notice_p, notice_c, is_notice=True)
+            self._push(notice_p, green(notice_p), is_notice=True)
             self.notices.append(f"New option added to doc: {sym}")
-        elif not in_doc and in_sup and self.full:
+        elif not in_eff and in_sup and self.full:
             notice_p = f"# + Restored from suppressed: {sym}"
-            notice_c = green(notice_p)
-            self._push(notice_p, notice_c, is_notice=True)
-            self.notices.append(f"Restored from suppressed: {sym}")
+            self._push(notice_p, green(notice_p), is_notice=True)
+
+        trailing = self._get_trailing(sym)
+
+        for cmt in self._get_pre_comments(sym):
+            self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
 
         p = _plain_line(node, prefix, connector, trailing)
         c = _colour_line(node, prefix, connector, trailing)
         self._push(p, c, symbol=sym)
 
-        for cmt in attached:
-            _, content = _strip_tree_prefix(cmt)
-            self._push(f"{child_pfx}{content}",
-                       f"{child_pfx}{gray(content)}")
+        for cmt in self._get_post_comments(sym):
+            self._push(f"{child_pfx}{cmt}", f"{child_pfx}{gray(cmt)}")
+
+        self._prev_knode = node
 
         if node.kind == "menuconfig" and node.children:
-            self._recurse(node, child_pfx, depth + 1)
+            self._recurse(node, child_pfx, 0)
 
 
-# ── Suppressed file updater ────────────────────────────────────────────────────
+# ── Updated suppressed file computation ───────────────────────────────────────
 
-def compute_new_suppressed(
-    sup_entries:  list[DocEntry],
-    doc_index:    dict[str, int],
-    knode_index:  dict[str, KNode],
-    full:         bool,
-) -> tuple[list[DocEntry], list[str]]:
-    """
-    Determine what goes into the updated suppressed file.
-
-    Rules:
-    - If --full: suppressed file is cleared (everything moved to doc).
-    - Otherwise: keep existing suppressed entries that still exist in Kconfig.
-      Entries whose symbol has vanished from Kconfig are silently dropped.
-
-    Note: Moving deleted-from-doc entries into suppressed is NOT done
-    automatically — the suppressed file is user-managed.  The script only
-    prunes stale entries (vanished symbols) from it.
-
-    Returns (new_entries, notices).
-    """
+def compute_new_suppressed(sup: DocFileParser,
+                           knode_index: dict[str, KNode],
+                           full: bool) -> tuple[list[RawEntry], list[str]]:
     notices: list[str] = []
     if full:
         return [], notices
-
-    new_entries: list[DocEntry] = []
-    for entry in sup_entries:
-        if entry.is_pure_comment:
-            new_entries.append(entry)
-            continue
+    new_entries: list[RawEntry] = []
+    for entry in sup.ordered:
         sym = entry.symbol
-        if not sym:
-            # Structural suppressed entry — keep as-is
-            new_entries.append(entry)
-            continue
-        if sym not in knode_index:
-            notices.append(f"Dropped vanished symbol from suppressed file: {sym}")
+        if sym and sym not in knode_index:
+            notices.append(
+                f"Dropped vanished symbol from suppressed: {sym}")
             continue
         new_entries.append(entry)
-
     return new_entries, notices
 
 
@@ -905,7 +1015,7 @@ def emit_kconfig_format(output_lines: list[OutputLine],
     print("#")
     seen: set[str] = set()
     for ol in output_lines:
-        if ol.is_notice or ol.is_warning:
+        if ol.is_blank or ol.is_notice or ol.is_warning:
             continue
         sym = ol.symbol
         if not sym or sym in seen:
@@ -921,28 +1031,59 @@ def emit_kconfig_format(output_lines: list[OutputLine],
             print(f"{sym}={node.value}")
 
 
-# ── Write doc / suppressed ────────────────────────────────────────────────────
+# ── Write helpers ──────────────────────────────────────────────────────────────
 
-def write_plain(path: Path, lines: list[OutputLine], skip_notices: bool = True):
+def write_doc(path: Path, lines: list[OutputLine]):
+    """Write plain doc file, skip notice/warning lines, collapse double blanks."""
     with path.open("w") as f:
+        last_blank = False
         for ol in lines:
-            if ol.is_warning:
+            if ol.is_warning or ol.is_notice:
                 continue
-            if skip_notices and ol.is_notice:
-                continue
-            f.write(ol.plain + "\n")
+            if ol.is_blank:
+                if not last_blank:
+                    f.write("\n")
+                last_blank = True
+            else:
+                f.write(ol.plain + "\n")
+                last_blank = False
 
 
-def write_suppressed(path: Path, entries: list[DocEntry]):
+def write_suppressed(path: Path, entries: list[RawEntry],
+                     knode_index: dict[str, KNode]):
+    """
+    Write suppressed file in doc format, with orphan blank lines inserted
+    between entries from unrelated subtrees.
+    """
     if not entries:
-        # Write empty file to signal the suppressed list is clear
         path.write_text("")
         return
+
     with path.open("w") as f:
+        prev_node: Optional[KNode] = None
         for entry in entries:
-            f.write(entry.raw_line + "\n")
-            for cmt in entry.attached_comments:
+            sym = entry.symbol
+            node = knode_index.get(sym) if sym else None
+
+            if node and _needs_blank(prev_node, node):
+                f.write("\n")
+
+            for cmt in entry.pre_comments:
                 f.write(cmt + "\n")
+
+            if sym and node:
+                # Write in full doc format (glyph comes from live .config)
+                tc = f" {entry.trailing_comment}" if entry.trailing_comment else ""
+                f.write(f"{node.raw_glyph()} {node.prompt or node.name}"
+                        f" ({node.name}){tc}\n")
+            elif entry.comment_text:
+                f.write(entry.comment_text + "\n")
+
+            for cmt in entry.post_comments:
+                f.write(cmt + "\n")
+
+            if node:
+                prev_node = node
 
 
 # ── Post-render depth / filter ─────────────────────────────────────────────────
@@ -953,7 +1094,7 @@ def _filter_output(lines: list[OutputLine],
     fw = filter_word.lower() if filter_word else None
     result = []
     for ol in lines:
-        if ol.is_notice or ol.is_warning:
+        if ol.is_blank or ol.is_notice or ol.is_warning:
             result.append(ol)
             continue
         d = _depth_of(ol.plain)
@@ -965,7 +1106,7 @@ def _filter_output(lines: list[OutputLine],
     return result
 
 
-# ── Summary stats ──────────────────────────────────────────────────────────────
+# ── Stats ──────────────────────────────────────────────────────────────────────
 
 def collect_stats(node: KNode, stats: dict):
     if node.kind in ("config", "menuconfig"):
@@ -994,34 +1135,20 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--kconfig",      default="Kconfig",
-                    help="Top-level Kconfig file (default: Kconfig)")
-    ap.add_argument("--dotconfig",    default=".config",
-                    help="Kernel .config file (default: .config)")
-    ap.add_argument("--doc",          default=DEFAULT_DOC,
-                    help=f"Doc file (default: {DEFAULT_DOC})")
-    ap.add_argument("--suppressed",   default=DEFAULT_SUP,
-                    help=f"Suppressed file (default: {DEFAULT_SUP})")
-    ap.add_argument("--arch",         default="arm64",
-                    help="Architecture (default: arm64)")
-    ap.add_argument("--add-new",      action="store_true",
-                    help="Add all symbols absent from both files to doc")
-    ap.add_argument("--add-new-enabled", action="store_true",
-                    help="Add only active ([*]/[M]) symbols absent from both files")
-    ap.add_argument("--full",         action="store_true",
-                    help="Restore suppressed + add all remaining symbols")
-    ap.add_argument("--emit-kconfig", action="store_true",
-                    help="Print Linux .config format to stdout, then exit")
-    ap.add_argument("--show",         action="store_true",
-                    help="Show coloured tree on stdout")
-    ap.add_argument("--depth",        type=int, default=None,
-                    help="Max tree depth (with --show)")
-    ap.add_argument("--filter",       default=None,
-                    help="Show subtrees containing WORD (with --show)")
-    ap.add_argument("--no-color",     action="store_true",
-                    help="Disable ANSI colours")
-    ap.add_argument("--no-doc",       action="store_true",
-                    help="Do not write any files this run")
+    ap.add_argument("--kconfig",         default="Kconfig")
+    ap.add_argument("--dotconfig",       default=".config")
+    ap.add_argument("--doc",             default=DEFAULT_DOC)
+    ap.add_argument("--suppressed",      default=DEFAULT_SUP)
+    ap.add_argument("--arch",            default="arm64")
+    ap.add_argument("--add-new",         action="store_true")
+    ap.add_argument("--add-new-enabled", action="store_true")
+    ap.add_argument("--full",            action="store_true")
+    ap.add_argument("--emit-kconfig",    action="store_true")
+    ap.add_argument("--show",            action="store_true")
+    ap.add_argument("--depth",           type=int, default=None)
+    ap.add_argument("--filter",          default=None)
+    ap.add_argument("--no-color",        action="store_true")
+    ap.add_argument("--no-doc",          action="store_true")
     args = ap.parse_args()
 
     if args.no_color or args.emit_kconfig:
@@ -1034,38 +1161,30 @@ def main():
     sup_path       = Path(args.suppressed)
 
     if not kconfig_path.exists():
-        sys.exit(
-            f"ERROR: Kconfig file not found: {kconfig_path}\n"
-            "Run this script from your kernel source root directory."
-        )
+        sys.exit(f"ERROR: Kconfig file not found: {kconfig_path}\n"
+                 "Run from your kernel source root directory.")
 
-    # 1. Parse Kconfig tree
     print("Parsing Kconfig hierarchy …", file=sys.stderr)
     parser = KconfigParser(arch=args.arch, kernel_root=kernel_root)
     root   = parser.parse(kconfig_path)
 
-    # 2. Load .config and annotate
     print(f"Loading {dotconfig_path} …", file=sys.stderr)
     cfg = load_dotconfig(dotconfig_path)
     annotate_tree(root, cfg)
     knode_index = build_knode_index(root)
 
-    # 3. Parse doc and suppressed files
     if doc_path.exists():
         print(f"Reading {doc_path} …", file=sys.stderr)
-    doc_entries, doc_index = parse_doc(doc_path)
+    doc = DocFileParser(doc_path, knode_index)
 
     if sup_path.exists():
         print(f"Reading {sup_path} …", file=sys.stderr)
-    sup_entries, sup_index = parse_doc(sup_path)
+    sup = DocFileParser(sup_path, knode_index)
 
-    # 4. Merge
     merger = Merger(
         root        = root,
-        doc_entries = doc_entries,
-        doc_index   = doc_index,
-        sup_entries = sup_entries,
-        sup_index   = sup_index,
+        doc         = doc,
+        sup         = sup,
         knode_index = knode_index,
         add_new     = args.add_new,
         add_new_en  = args.add_new_enabled,
@@ -1073,41 +1192,34 @@ def main():
     )
     output_lines = merger.run()
 
-    # 5. Compute updated suppressed entries
-    new_sup, sup_notices = compute_new_suppressed(
-        sup_entries  = merger.new_sup_entries,
-        doc_index    = doc_index,
-        knode_index  = knode_index,
-        full         = args.full,
-    )
+    new_sup, sup_notices = compute_new_suppressed(sup, knode_index, args.full)
 
-    # 6. Apply depth/filter (only meaningful with --show)
     show_lines = output_lines
     if args.show and (args.depth is not None or args.filter):
         show_lines = _filter_output(output_lines, args.depth, args.filter)
 
-    # 7. --emit-kconfig
     if args.emit_kconfig:
         emit_kconfig_format(output_lines, knode_index)
         return
 
-    # 8. Write files
     if not args.no_doc:
-        write_plain(doc_path, output_lines, skip_notices=True)
+        write_doc(doc_path, output_lines)
         print(f"Doc written → {doc_path}", file=sys.stderr)
 
-        write_suppressed(sup_path, new_sup)
+        # Remove from suppressed any symbols now in doc (conflict resolution)
+        doc_syms = set(merger._eff_doc.keys())
+        new_sup = [e for e in new_sup
+                   if not e.symbol or e.symbol not in doc_syms]
+        write_suppressed(sup_path, new_sup, knode_index)
         if args.full and not new_sup:
-            print(f"Suppressed file cleared → {sup_path}", file=sys.stderr)
+            print(f"Suppressed cleared → {sup_path}", file=sys.stderr)
         else:
-            print(f"Suppressed file updated → {sup_path}", file=sys.stderr)
+            print(f"Suppressed updated → {sup_path}", file=sys.stderr)
 
-    # 9. --show: coloured tree to stdout
     if args.show:
         for ol in show_lines:
             print(ol.coloured)
 
-    # 10. Notices (always to stderr; also inline in --show above via output_lines)
     all_notices = merger.notices + sup_notices
     if all_notices:
         print(file=sys.stderr)
@@ -1115,41 +1227,37 @@ def main():
         for n in all_notices:
             print(f"  + {n}", file=sys.stderr)
 
-    # 11. Warnings
-    if merger.warnings:
+    all_warnings = merger.warnings
+    if all_warnings:
         print(file=sys.stderr)
-        print(f"{magenta('WARNINGS')} ({len(merger.warnings)}):", file=sys.stderr)
-        for w in merger.warnings:
+        print(f"{magenta('WARNINGS')} ({len(all_warnings)}):", file=sys.stderr)
+        for w in all_warnings:
             print(f"  {magenta('!')} {w}", file=sys.stderr)
 
-    # 12. Stats (always)
     stats: dict = {"total": 0, "yes": 0, "module": 0, "no": 0,
                    "unset": 0, "other": 0}
     collect_stats(root, stats)
-    active_in_doc = sum(
-        1 for ol in output_lines
-        if ol.symbol and not ol.is_notice and not ol.is_warning
-        and knode_index.get(ol.symbol, KNode("", "")).is_active()
+    tracked = [ol for ol in output_lines
+               if ol.symbol and not ol.is_notice and not ol.is_warning]
+    active_tracked = sum(
+        1 for ol in tracked
+        if knode_index.get(ol.symbol, KNode("", "")).is_active()
     )
     print(file=sys.stderr)
     print(
-        f"{bold('Kconfig total')}: "
+        f"{bold('Kconfig')}: "
         f"{green(str(stats['yes']))} built-in  "
         f"{yellow(str(stats['module']))} module  "
         f"{gray(str(stats['no']))} disabled  "
         f"{gray(str(stats['unset']))} unset  "
-        f"/ {stats['total']} symbols",
+        f"/ {stats['total']} total",
         file=sys.stderr,
     )
     print(
-        f"{bold('Doc file')}:      "
-        f"{len([o for o in output_lines if o.symbol and not o.is_notice])} symbols tracked  "
-        f"({active_in_doc} active)",
-        file=sys.stderr,
-    )
-    print(
-        f"{bold('Suppressed')}:    "
-        f"{len([e for e in new_sup if e.symbol])} symbols hidden",
+        f"{bold('Doc')}:     "
+        f"{len(tracked)} tracked  "
+        f"({active_tracked} active)  "
+        f"{len([e for e in new_sup if e.symbol])} suppressed",
         file=sys.stderr,
     )
 
