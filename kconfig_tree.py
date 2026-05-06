@@ -2,17 +2,14 @@
 """
 kconfig_tree.py — Kernel configuration documentation tool.
 
-Maintains a human-editable documentation tree of kernel config options,
-tracking which are active and merging updates across kernel versions.
-
 THREE-FILE MODEL
 ────────────────
   .config                     Kernel truth (what is active)
   kconfig_doc.txt             User allowlist (what to show and document)
   kconfig_doc_suppressed.txt  User denylist (what to permanently hide)
 
-MERGE RULES (per symbol, every run)
-────────────────────────────────────
+MERGE RULES
+───────────
   In doc                    → emit, update glyph, warn on value mismatch
   In suppressed             → never emit (unless --full)
   In neither, inactive      → silent
@@ -24,31 +21,30 @@ MERGE RULES (per symbol, every run)
 
 INPUT FORMATS ACCEPTED IN DOC / SUPPRESSED FILES
 ─────────────────────────────────────────────────
-  Full doc format:   ├─ [*] Some prompt (SYMBOL_NAME) # optional comment
-  Bare symbol:       CONFIG_SYMBOL_NAME  # optional comment
-  .config format:    CONFIG_SYMBOL=y  or  # CONFIG_SYMBOL is not set
-  Pure comment:      # free text
-
-All formats are normalised to full doc format on next write.
+  Full doc:    ├─ [*] Some prompt (SYMBOL_NAME) # optional comment
+  Bare symbol: CONFIG_SYMBOL_NAME  # optional comment
+  .config set: CONFIG_SYMBOL=y
+  .config unset: # CONFIG_SYMBOL is not set
+  Pure comment: # free text
 
 COMMENT ANCHORING
 ─────────────────
   option A
-  # comment 1    ← anchored below: attached to option A
-  # comment 2    ← anchored to comment 1 (same group)
-                 ← blank line breaks chain
-  # comment 3    ← blank above + option directly below → pre-anchored to B
-  # comment 4    ← same group as comment 3
+  # post-comment   ← directly below option, no blank → anchored to A (same indent)
+                   ← blank below post-comment is preserved
+  
+                   ← blank above
+  # pre-comment    ← blank above + option directly below → anchored to B (same indent)
   option B
-                 ← blank line
-  # comment 5    ← blank above, no option below → freestanding (attached above)
-  # comment 6    ← same group as comment 5
+
+                   ← blank above
+  # freestanding   ← blank above AND blank below → anchored above, both blanks preserved
+                   ← blank below
 
 ORPHAN SPACING
 ──────────────
-  Whenever two consecutive entries would imply a parent-child relationship
-  that doesn't exist in the Kconfig tree, a blank line is inserted between
-  them so the tree structure cannot be visually misread.
+  A blank line is inserted between two config/menuconfig nodes that come
+  from completely different subtrees so the tree cannot be misread.
 
 USAGE
 ─────
@@ -56,11 +52,10 @@ USAGE
   python3 kconfig_tree.py --full              # first run, everything
   python3 kconfig_tree.py                     # normal update
   python3 kconfig_tree.py --show              # view coloured tree
-  python3 kconfig_tree.py --add-new-enabled   # after kernel upgrade
   python3 kconfig_tree.py --emit-kconfig > my.config
 
-  Suppress an option:   move its line from doc → suppressed file
-  Un-suppress:          delete its line from suppressed file
+  Suppress: move line from doc → suppressed file
+  Un-suppress: delete line from suppressed file
 
 OPTIONS
 ───────
@@ -138,7 +133,7 @@ class KNode:
     parent: Optional["KNode"] = field(default=None, repr=False)
     file: str = ""
     lineno: int = 0
-    value: Optional[str] = None   # filled from .config
+    value: Optional[str] = None
 
     def symbol(self) -> str:
         return f"CONFIG_{self.name}" if self.name else ""
@@ -172,8 +167,7 @@ class KNode:
         return cyan(f"[={v}]")
 
     def ancestry(self) -> list["KNode"]:
-        """Return list of ancestors from root down to (not including) self."""
-        chain: list[KNode] = []
+        chain: list["KNode"] = []
         p = self.parent
         while p:
             chain.append(p)
@@ -233,8 +227,7 @@ class KconfigParser:
             lines = path.read_text(errors="replace").splitlines()
         except OSError:
             parent.children.append(
-                KNode(kind="comment", name="",
-                      prompt=f"[missing: {path}]"))
+                KNode(kind="comment", name="", prompt=f"[missing: {path}]"))
             return
         self._parse_lines(lines, path, parent)
 
@@ -362,7 +355,7 @@ class KconfigParser:
                 help_indent = len(line) - len(line.lstrip()) + 1
                 continue
 
-            _ATTR_RE.match(line)  # consume silently
+            _ATTR_RE.match(line)
 
 
 # ── .config loader ─────────────────────────────────────────────────────────────
@@ -406,20 +399,20 @@ def build_knode_index(node: KNode,
 
 # ── Doc / suppressed file parser ───────────────────────────────────────────────
 #
-# Accepts four input formats per line:
-#   1. Full doc:     ├─ [*] Some prompt (SYMBOL) # comment
-#   2. Bare symbol:  CONFIG_SYMBOL  # comment
-#   3. .config set:  CONFIG_SYMBOL=value
+# Accepted input formats per line:
+#   1. Full doc:      ├─ [*] Some prompt (SYMBOL) # comment
+#   2. Bare symbol:   CONFIG_SYMBOL  # comment
+#   3. .config set:   CONFIG_SYMBOL=value
 #   4. .config unset: # CONFIG_SYMBOL is not set
-#   5. Pure comment: # free text
+#   5. Pure comment:  # free text
 #
-# Comment anchoring (resolved after all lines are parsed):
-#   - A comment block directly below an option/menu → anchored below
-#     (attached to the option above it, emitted after it)
-#   - A comment block with a blank line above AND an option directly below
-#     → anchored above (pre-comment of the option below, emitted before it)
-#   - A comment block with blank above and nothing/blank below → freestanding,
-#     attached to option above as trailing group
+# Comment anchoring (Pass 2):
+#   Comments directly below an option (no blank between) → post-comment of that option
+#   Comments with blank above + option directly below   → pre-comment of option below
+#   Comments with blank above + blank/nothing below     → post-comment of option above
+#                                                         (freestanding)
+#   All cases: blank lines immediately before/after the
+#   comment group are recorded and reproduced on output.
 
 _DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
 _TRAILING_CMT_RE = re.compile(r" (#.*)$")
@@ -432,28 +425,20 @@ _KCONFIG_CMT_RE  = re.compile(r"^--- (.+) ---$")
 
 @dataclass
 class RawEntry:
-    """One logical item parsed from a doc/suppressed file, before anchoring."""
-    symbol: str           # CONFIG_FOO or ""
-    trailing_comment: str # "# …" on same line as option, or ""
-    file_value: str       # value from =y/.config format, or ""
-    is_pure_comment: bool = False
-    comment_text: str = ""  # content of pure comment line(s)
-    blank_before: bool = False  # was there a blank line before this entry?
-    # Filled after anchoring:
-    pre_comments:  list[str] = field(default_factory=list)  # comment lines before
-    post_comments: list[str] = field(default_factory=list)  # comment lines after
-
-
-def _extract_symbol_from_doc_line(content_clean: str) -> str:
-    """Try to extract CONFIG_SYMBOL from full doc format (SYMBOL) tag."""
-    m = _DOC_SYMBOL_RE.search(content_clean)
-    if m:
-        return f"CONFIG_{m.group(1)}"
-    return ""
+    """One logical item parsed from a doc/suppressed file."""
+    symbol: str            # CONFIG_FOO or ""
+    trailing_comment: str  # "# …" on same line, or ""
+    file_value: str        # value from =y / is-not-set format, or ""
+    comment_text: str = "" # normalised prompt key for structural lines
+    blank_before: bool = False
+    # Comment groups anchored to this entry:
+    pre_comments:  list[str] = field(default_factory=list)
+    pre_blank:     bool = False   # blank line before the pre-comment group
+    post_comments: list[str] = field(default_factory=list)
+    post_blank:    bool = False   # blank line after the post-comment group
 
 
 def _extract_trailing(content: str) -> tuple[str, str]:
-    """Return (content_without_trailing, trailing_comment)."""
     m = _TRAILING_CMT_RE.search(content)
     if m:
         return content[:m.start()], m.group(1)
@@ -461,7 +446,6 @@ def _extract_trailing(content: str) -> tuple[str, str]:
 
 
 def _struct_prompt_key(content_clean: str) -> str:
-    """Normalise structural line content to a lookup key (strip leader/closer)."""
     s = _STRUCT_LEADER.sub("", content_clean, count=1)
     s = _KCONFIG_CMT_RE.sub(r"\1", s)
     return s.strip()
@@ -469,11 +453,13 @@ def _struct_prompt_key(content_clean: str) -> str:
 
 class DocFileParser:
     """
-    Parses a doc or suppressed file into RawEntry objects, resolves comment
-    anchoring, and returns:
-      symbol_index:  CONFIG_FOO → RawEntry
-      struct_index:  normalised_prompt → RawEntry  (for structural lines)
-      ordered:       list[RawEntry] in file order (non-comment entries)
+    Parses a doc or suppressed file.
+
+    Public attributes:
+      symbol_index : dict[str, RawEntry]   CONFIG_FOO → entry
+      struct_index : dict[str, RawEntry]   prompt_key → entry (structural lines)
+      ordered      : list[RawEntry]        all entries in file order
+      warnings     : list[str]
     """
 
     def __init__(self, path: Path, knode_index: dict[str, KNode]):
@@ -491,10 +477,11 @@ class DocFileParser:
 
         raw_lines = self.path.read_text(errors="replace").splitlines()
 
-        # ── Pass 1: classify every line ───────────────────────────────────────
-        # Items: ("option", RawEntry) | ("comment", str) | ("blank",)
+        # ── Pass 1: classify every line into items ────────────────────────────
+        # item = ("option", RawEntry) | ("comment", str) | ("blank",)
 
         items: list[tuple] = []
+
         for raw in raw_lines:
             line = strip_ansi(raw).rstrip()
 
@@ -502,18 +489,18 @@ class DocFileParser:
                 items.append(("blank",))
                 continue
 
-            # Check for .config unset format first (starts with #)
+            # .config unset  (starts with #, must check before pure-comment)
             m = _DOTCFG_UNSET_RE.match(line)
             if m:
-                sym = m.group(1)
-                entry = RawEntry(symbol=sym, trailing_comment="",
-                                 file_value="n")
-                items.append(("option", entry))
+                items.append(("option",
+                              RawEntry(symbol=m.group(1),
+                                       trailing_comment="",
+                                       file_value="n")))
                 continue
 
             _prefix, content = _strip_tree_prefix(line)
 
-            # Pure comment (not .config unset)
+            # Pure comment
             if content.startswith("#"):
                 items.append(("comment", content))
                 continue
@@ -521,49 +508,63 @@ class DocFileParser:
             content_clean, trailing = _extract_trailing(content)
             content_clean = content_clean.strip()
 
-            # .config set format: CONFIG_FOO=value
+            # .config set:  CONFIG_FOO=value
             m = _DOTCFG_SET_RE.match(content_clean)
             if m:
-                sym, val = m.group(1), m.group(2)
-                entry = RawEntry(symbol=sym, trailing_comment=trailing,
-                                 file_value=val)
-                items.append(("option", entry))
+                items.append(("option",
+                              RawEntry(symbol=m.group(1),
+                                       trailing_comment=trailing,
+                                       file_value=m.group(2))))
                 continue
 
-            # Bare symbol: CONFIG_FOO (with no = sign, no (NAME) tag)
+            # Bare symbol:  CONFIG_FOO  (no = and no (NAME) tag)
             m = _BARE_SYMBOL_RE.match(content_clean)
             if m and not _DOC_SYMBOL_RE.search(content_clean):
-                sym = m.group(1)
-                entry = RawEntry(symbol=sym, trailing_comment=trailing,
-                                 file_value="")
-                items.append(("option", entry))
+                items.append(("option",
+                              RawEntry(symbol=m.group(1),
+                                       trailing_comment=trailing,
+                                       file_value="")))
                 continue
 
             # Full doc format with (SYMBOL) tag
-            sym = _extract_symbol_from_doc_line(content_clean)
-            if sym:
-                entry = RawEntry(symbol=sym, trailing_comment=trailing,
-                                 file_value="")
-                items.append(("option", entry))
+            ms = _DOC_SYMBOL_RE.search(content_clean)
+            if ms:
+                sym = f"CONFIG_{ms.group(1)}"
+                items.append(("option",
+                              RawEntry(symbol=sym,
+                                       trailing_comment=trailing,
+                                       file_value="")))
                 continue
 
-            # Structural line (menu/choice/if/kconfig-comment) — no symbol
+            # Structural line (menu/choice/if/kconfig-comment)
             prompt_key = _struct_prompt_key(content_clean)
             if prompt_key:
-                entry = RawEntry(symbol="", trailing_comment=trailing,
-                                 file_value="", comment_text=prompt_key)
-                items.append(("option", entry))
+                items.append(("option",
+                              RawEntry(symbol="",
+                                       trailing_comment=trailing,
+                                       file_value="",
+                                       comment_text=prompt_key)))
                 continue
 
-            # Unrecognised non-blank non-comment line — treat as freestanding comment
+            # Unrecognised — treat as freestanding comment
             items.append(("comment", content))
 
-        # ── Pass 2: resolve comment anchoring ────────────────────────────────
-        # Walk items, collecting comment runs and deciding where to attach them.
+        # ── Pass 2: resolve comment anchoring ─────────────────────────────────
+        #
+        # For each contiguous run of comment lines we record:
+        #   blank_above  = blank line immediately before the run
+        #   blank_below  = blank line immediately after the run
+        #   next_option  = is the next non-blank item an option?
+        #
+        # Decision:
+        #   blank_above AND next_option immediately after (no blank between)
+        #       → pre-comment of that option; pre_blank = blank_above
+        #   otherwise
+        #       → post-comment of the preceding option; post_blank = blank_below
 
         n = len(items)
         i = 0
-        option_entries: list[RawEntry] = []  # in file order
+        option_entries: list[RawEntry] = []
 
         while i < n:
             kind = items[i][0]
@@ -574,37 +575,36 @@ class DocFileParser:
 
             if kind == "option":
                 entry = items[i][1]
-                entry.blank_before = (i > 0 and items[i-1][0] == "blank")
+                entry.blank_before = (i > 0 and items[i - 1][0] == "blank")
                 option_entries.append(entry)
                 i += 1
                 continue
 
-            if kind == "comment":
-                # Collect contiguous comment lines
-                cmt_lines: list[str] = []
-                while i < n and items[i][0] == "comment":
-                    cmt_lines.append(items[i][1])
-                    i += 1
+            # kind == "comment"
+            cmt_start = i
+            cmt_lines: list[str] = []
+            while i < n and items[i][0] == "comment":
+                cmt_lines.append(items[i][1])
+                i += 1
+            # i now points to first item after the comment run
 
-                blank_above = (len(option_entries) == 0 or
-                               (i - len(cmt_lines) > 0 and
-                                items[i - len(cmt_lines) - 1][0] == "blank"))
+            blank_above = (cmt_start > 0 and items[cmt_start - 1][0] == "blank")
+            # next_option: option immediately after comment run (no blank between)
+            next_is_option = (i < n and items[i][0] == "option")
+            # blank immediately after comment run
+            blank_below = (i < n and items[i][0] == "blank")
 
-                # Is there an option immediately after (no blank)?
-                next_is_option = (i < n and items[i][0] == "option")
-
-                if blank_above and next_is_option:
-                    # Pre-anchor: attach to the option below
-                    # We defer: mark with a sentinel and resolve after
-                    # collecting the next option
-                    # Simplest: peek ahead and attach now
-                    next_entry = items[i][1]
-                    next_entry.pre_comments = cmt_lines
-                elif option_entries:
-                    # Post-anchor or freestanding: attach to option above
-                    option_entries[-1].post_comments.extend(cmt_lines)
-                # else: comments before any option — will be prepended to first
-                continue
+            if blank_above and next_is_option:
+                # Pre-anchor: will be attached when we process that option entry
+                # Peek and set directly on the next item's RawEntry
+                next_entry = items[i][1]
+                next_entry.pre_comments = cmt_lines
+                next_entry.pre_blank = blank_above  # always True here, kept for clarity
+            elif option_entries:
+                # Post-anchor (includes freestanding): attach to preceding option
+                option_entries[-1].post_comments.extend(cmt_lines)
+                option_entries[-1].post_blank = blank_below
+            # Comments before any option are discarded (nowhere to anchor)
 
         # ── Pass 3: index entries ─────────────────────────────────────────────
 
@@ -618,15 +618,13 @@ class DocFileParser:
                         f"Duplicate symbol {entry.symbol} in "
                         f"{self.path.name} — keeping first occurrence")
             elif entry.comment_text:
-                # Structural entry — key by prompt
                 key = entry.comment_text
                 if key not in self.struct_index:
                     self.struct_index[key] = entry
                     self.ordered.append(entry)
-            # Pure structural with no key: discard (was unrecognised)
 
         # ── Pass 4: validate symbols against Kconfig tree ─────────────────────
-        bad = []
+
         for sym in list(self.symbol_index.keys()):
             if sym not in self.knode_index:
                 self.warnings.append(
@@ -636,49 +634,42 @@ class DocFileParser:
                 self.ordered = [e for e in self.ordered if e.symbol != sym]
 
         # ── Pass 5: value mismatch warnings ───────────────────────────────────
+
         for sym, entry in self.symbol_index.items():
             if not entry.file_value:
                 continue
             node = self.knode_index.get(sym)
             if node is None:
                 continue
-            live = (node.value or "").strip()
+            live = (node.value or "").strip().strip('"')
             fv   = entry.file_value.strip().strip('"')
-            live_s = live.strip('"')
-            if fv != live_s and fv not in ("", "n") and live_s not in ("", "n"):
+            if fv != live and fv not in ("", "n") and live not in ("", "n"):
                 self.warnings.append(
                     f"Value mismatch for {sym}: "
-                    f"file has ={fv}, .config has ={live_s} — using .config value")
+                    f"file has ={fv}, .config has ={live} — using .config value")
 
 
-# ── Ancestry helpers ──────────────────────────────────────────────────────────
-
-def _shared_ancestor_depth(a: KNode, b: KNode) -> int:
-    """How many ancestors do a and b share (from root)?"""
-    aa = [id(n) for n in a.ancestry()] + [id(a)]
-    bb = set([id(n) for n in b.ancestry()] + [id(b)])
-    count = 0
-    for aid in aa:
-        if aid in bb:
-            count += 1
-    return count
-
+# ── Ancestry / orphan-blank helper ────────────────────────────────────────────
 
 def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
     """
-    Return True if a blank line should be inserted before curr_node because
-    its parent-child relationship with prev_node would be ambiguous.
-    Two nodes need a blank when they share no structural parent closer than
-    the root, i.e. they come from completely different subtrees.
+    True when a blank should be inserted between prev_node and curr_node
+    because they come from unrelated subtrees.
+
+    Only fires for config/menuconfig nodes.  Structural nodes (menu/choice/if)
+    are not used as prev_node — they provide natural grouping and comparing
+    them would cause spurious blanks between siblings inside the same menu.
     """
     if prev_node is None:
         return False
+    if prev_node.kind not in ("config", "menuconfig"):
+        return False
+    if curr_node.kind not in ("config", "menuconfig"):
+        return False
     prev_anc = set(id(n) for n in prev_node.ancestry())
     curr_anc = set(id(n) for n in curr_node.ancestry())
-    # If they share an ancestor other than root (depth > 1 shared), no blank.
     shared = prev_anc & curr_anc
-    # Remove root (always shared); if nothing else shared → blank
-    # The root has no parent, so we identify it by parent == None
+    # Any shared non-root ancestor means same subtree → no blank needed
     non_root_shared = [n for n in prev_node.ancestry() + curr_node.ancestry()
                        if id(n) in shared and n.parent is not None]
     return len(non_root_shared) == 0
@@ -696,8 +687,8 @@ def _plain_body(node: KNode) -> str:
         return f"--- {node.prompt} ---"
     if node.kind == "if":
         return f"[{node.prompt}]"
-    prompt  = node.prompt or node.name
-    tag     = f" ({node.name})" if node.name else ""
+    prompt = node.prompt or node.name
+    tag    = f" ({node.name})" if node.name else ""
     return f"{glyph} {prompt}{tag}" if glyph else f"{prompt}{tag}"
 
 
@@ -712,9 +703,9 @@ def _colour_body(node: KNode) -> str:
         return gray(f"--- {node.prompt} ---")
     if node.kind == "if":
         return gray(f"[{node.prompt}]")
-    prompt  = node.prompt or node.name
-    pstr    = bold(prompt) if node.is_active() else gray(prompt)
-    tag     = gray(f" ({node.name})") if node.name else ""
+    prompt = node.prompt or node.name
+    pstr   = bold(prompt) if node.is_active() else gray(prompt)
+    tag    = gray(f" ({node.name})") if node.name else ""
     return f"{glyph} {pstr}{tag}" if glyph else f"{pstr}{tag}"
 
 
@@ -742,7 +733,7 @@ class OutputLine:
     is_warning: bool = False
 
 
-def _blank() -> OutputLine:
+def _blank_line() -> OutputLine:
     return OutputLine(plain="", coloured="", is_blank=True)
 
 
@@ -771,10 +762,10 @@ class Merger:
         self.notices:  list[str] = []
         self.warnings: list[str] = list(doc.warnings) + list(sup.warnings)
 
-        self._emitted:  set[str] = set()   # emitted CONFIG_ symbols
-        self._struct_emitted: set[int] = set()  # id(KNode) for structural
+        self._emitted:        set[str] = set()   # CONFIG_FOO
+        self._struct_emitted: set[int] = set()   # id(KNode)
 
-        # Effective doc set: for --full, merge suppressed into doc first
+        # Effective doc: for --full merge suppressed in first
         self._eff_doc:    dict[str, RawEntry] = dict(doc.symbol_index)
         self._eff_struct: dict[str, RawEntry] = dict(doc.struct_index)
         if full:
@@ -786,7 +777,9 @@ class Merger:
                 if key not in self._eff_struct:
                     self._eff_struct[key] = entry
 
-        self._prev_knode: Optional[KNode] = None  # for orphan blank detection
+        # Only updated by config/menuconfig nodes, never by structural ones.
+        # Used exclusively for orphan-blank detection.
+        self._prev_knode: Optional[KNode] = None
 
     # ── helpers ────────────────────────────────────────────────────────────────
 
@@ -797,9 +790,8 @@ class Merger:
                                       is_warning=is_warning))
 
     def _push_blank(self):
-        # Avoid double blanks
         if self.output and not self.output[-1].is_blank:
-            self.output.append(_blank())
+            self.output.append(_blank_line())
 
     def _in_eff_doc(self, sym: str) -> bool:
         return sym in self._eff_doc
@@ -821,36 +813,14 @@ class Merger:
             return True
         return False
 
-    def _get_trailing(self, sym: str) -> str:
-        e = self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
-        return e.trailing_comment if e else ""
+    def _entry(self, sym: str) -> Optional[RawEntry]:
+        return self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
 
-    def _get_pre_comments(self, sym: str) -> list[str]:
-        e = self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
-        return e.pre_comments if e else []
+    def _struct_entry(self, key: str) -> Optional[RawEntry]:
+        return self._eff_struct.get(key) or self.sup.struct_index.get(key)
 
-    def _get_post_comments(self, sym: str) -> list[str]:
-        e = self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
-        return e.post_comments if e else []
-
-    def _get_struct_trailing(self, key: str) -> str:
-        e = self._eff_struct.get(key) or self.sup.struct_index.get(key)
-        return e.trailing_comment if e else ""
-
-    def _get_struct_pre(self, key: str) -> list[str]:
-        e = self._eff_struct.get(key) or self.sup.struct_index.get(key)
-        return e.pre_comments if e else []
-
-    def _get_struct_post(self, key: str) -> list[str]:
-        e = self._eff_struct.get(key) or self.sup.struct_index.get(key)
-        return e.post_comments if e else []
-
-    def _emit_comments(self, lines: list[str], prefix: str):
-        for cmt in lines:
-            self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
-
-    def _maybe_blank(self, curr_node: KNode):
-        """Insert blank if curr_node and prev_node have unrelated ancestry."""
+    def _maybe_orphan_blank(self, curr_node: KNode):
+        """Insert blank if curr and prev are from unrelated subtrees."""
         if _needs_blank(self._prev_knode, curr_node):
             self._push_blank()
 
@@ -860,15 +830,15 @@ class Merger:
         hdr = f"⚙ {self.root.prompt or 'Linux Kernel Configuration'}"
         self._push(hdr, bold(cyan(hdr)))
         self._check_conflicts()
-        self._recurse(self.root, prefix="", depth=0)
+        self._recurse(self.root, prefix="")
         return self.output
 
     def _check_conflicts(self):
         for sym in self.doc.symbol_index:
             if sym in self.sup.symbol_index:
-                msg = (f"Conflict: {sym} in both doc and suppressed "
-                       f"— doc wins, removing from suppressed")
-                self.warnings.append(msg)
+                self.warnings.append(
+                    f"Conflict: {sym} in both doc and suppressed "
+                    f"— doc wins, removing from suppressed")
 
     def _has_visible_children(self, node: KNode) -> bool:
         for child in node.children:
@@ -889,7 +859,6 @@ class Merger:
                 if self._should_emit(child):
                     out.append(child)
                 else:
-                    # Notice for active options in neither file
                     sym = child.symbol()
                     if (child.is_active()
                             and not self._in_eff_doc(sym)
@@ -897,8 +866,6 @@ class Merger:
                             and not self.add_new
                             and not self.add_new_en
                             and not self.full):
-                        # Only notice leaf-active, not menuconfig containers
-                        # whose children are already tracked
                         if child.kind != "menuconfig" or not any(
                                 self._in_eff_doc(c.symbol())
                                 for c in child.children if c.symbol()):
@@ -912,7 +879,7 @@ class Merger:
                 out.append(child)
         return out
 
-    def _recurse(self, parent: KNode, prefix: str, depth: int):
+    def _recurse(self, parent: KNode, prefix: str):
         children = self._visible_children(parent)
         for idx, child in enumerate(children):
             is_last   = idx == len(children) - 1
@@ -923,30 +890,39 @@ class Merger:
     def _emit_child(self, node: KNode, prefix: str, connector: str,
                     child_pfx: str):
 
-        # ── structural ─────────────────────────────────────────────────────────
+        # ── structural nodes (menu / choice / if / kconfig-comment) ───────────
         if node.kind in ("menu", "choice", "if", "comment"):
             nid = id(node)
             if nid in self._struct_emitted:
-                self._recurse(node, child_pfx, 0)
+                self._recurse(node, child_pfx)
                 return
             self._struct_emitted.add(nid)
 
-            self._maybe_blank(node)
-            key      = node.prompt.strip() if node.prompt else ""
-            trailing = self._get_struct_trailing(key)
+            key   = node.prompt.strip() if node.prompt else ""
+            entry = self._struct_entry(key)
 
-            for cmt in self._get_struct_pre(key):
-                self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
+            # Pre-comments (blank before pre-group preserved)
+            if entry and entry.pre_blank:
+                self._push_blank()
+            if entry:
+                for cmt in entry.pre_comments:
+                    self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
 
-            p = _plain_line(node, prefix, connector, trailing)
-            c = _colour_line(node, prefix, connector, trailing)
-            self._push(p, c)
+            trailing = entry.trailing_comment if entry else ""
+            self._push(_plain_line(node, prefix, connector, trailing),
+                       _colour_line(node, prefix, connector, trailing))
 
-            for cmt in self._get_struct_post(key):
-                self._push(f"{child_pfx}{cmt}", f"{child_pfx}{gray(cmt)}")
+            # Post-comments at the same indent level as the structural line
+            # (prefix, not child_pfx — comments sit beside the node)
+            if entry:
+                for cmt in entry.post_comments:
+                    self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
+                if entry.post_blank:
+                    self._push_blank()
 
-            self._prev_knode = node
-            self._recurse(node, child_pfx, 0)
+            # NOTE: structural nodes do NOT update _prev_knode.
+            # Only config/menuconfig nodes do (below).
+            self._recurse(node, child_pfx)
             return
 
         # ── config / menuconfig ────────────────────────────────────────────────
@@ -955,53 +931,63 @@ class Merger:
             return
         self._emitted.add(sym)
 
-        self._maybe_blank(node)
+        # Orphan blank: only between unrelated config/menuconfig nodes
+        self._maybe_orphan_blank(node)
 
+        entry  = self._entry(sym)
         in_eff = self._in_eff_doc(sym)
         in_sup = self._in_sup(sym)
 
-        # Notices for newly added symbols
-        if not in_eff and not in_sup and (
-                self.add_new or self.add_new_en or self.full):
-            notice_p = f"# + New option added to doc: {sym}"
-            self._push(notice_p, green(notice_p), is_notice=True)
+        # Notices for newly added / restored symbols
+        if not in_eff and not in_sup and (self.add_new or self.add_new_en or self.full):
+            msg = f"# + New option added to doc: {sym}"
+            self._push(msg, green(msg), is_notice=True)
             self.notices.append(f"New option added to doc: {sym}")
         elif not in_eff and in_sup and self.full:
-            notice_p = f"# + Restored from suppressed: {sym}"
-            self._push(notice_p, green(notice_p), is_notice=True)
+            msg = f"# + Restored from suppressed: {sym}"
+            self._push(msg, green(msg), is_notice=True)
 
-        trailing = self._get_trailing(sym)
+        # Pre-comments at same indent level as the option (prefix, not child_pfx)
+        if entry and entry.pre_blank:
+            self._push_blank()
+        if entry:
+            for cmt in entry.pre_comments:
+                self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
 
-        for cmt in self._get_pre_comments(sym):
-            self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
+        trailing = entry.trailing_comment if entry else ""
+        self._push(_plain_line(node, prefix, connector, trailing),
+                   _colour_line(node, prefix, connector, trailing),
+                   symbol=sym)
 
-        p = _plain_line(node, prefix, connector, trailing)
-        c = _colour_line(node, prefix, connector, trailing)
-        self._push(p, c, symbol=sym)
+        # Post-comments at same indent level as the option (prefix, not child_pfx)
+        if entry:
+            for cmt in entry.post_comments:
+                self._push(f"{prefix}{cmt}", f"{prefix}{gray(cmt)}")
+            if entry.post_blank:
+                self._push_blank()
 
-        for cmt in self._get_post_comments(sym):
-            self._push(f"{child_pfx}{cmt}", f"{child_pfx}{gray(cmt)}")
-
+        # Update _prev_knode ONLY for config/menuconfig, never for structural
         self._prev_knode = node
 
         if node.kind == "menuconfig" and node.children:
-            self._recurse(node, child_pfx, 0)
+            self._recurse(node, child_pfx)
 
 
-# ── Updated suppressed file computation ───────────────────────────────────────
+# ── Suppressed file update ────────────────────────────────────────────────────
 
-def compute_new_suppressed(sup: DocFileParser,
-                           knode_index: dict[str, KNode],
-                           full: bool) -> tuple[list[RawEntry], list[str]]:
+def compute_new_suppressed(
+    sup:         DocFileParser,
+    knode_index: dict[str, KNode],
+    full:        bool,
+) -> tuple[list[RawEntry], list[str]]:
     notices: list[str] = []
     if full:
         return [], notices
     new_entries: list[RawEntry] = []
     for entry in sup.ordered:
-        sym = entry.symbol
-        if sym and sym not in knode_index:
+        if entry.symbol and entry.symbol not in knode_index:
             notices.append(
-                f"Dropped vanished symbol from suppressed: {sym}")
+                f"Dropped vanished symbol from suppressed: {entry.symbol}")
             continue
         new_entries.append(entry)
     return new_entries, notices
@@ -1034,7 +1020,8 @@ def emit_kconfig_format(output_lines: list[OutputLine],
 # ── Write helpers ──────────────────────────────────────────────────────────────
 
 def write_doc(path: Path, lines: list[OutputLine]):
-    """Write plain doc file, skip notice/warning lines, collapse double blanks."""
+    """Write plain doc file. Notice/warning lines are not persisted.
+    Consecutive blanks are collapsed to one."""
     with path.open("w") as f:
         last_blank = False
         for ol in lines:
@@ -1051,37 +1038,28 @@ def write_doc(path: Path, lines: list[OutputLine]):
 
 def write_suppressed(path: Path, entries: list[RawEntry],
                      knode_index: dict[str, KNode]):
-    """
-    Write suppressed file in doc format, with orphan blank lines inserted
-    between entries from unrelated subtrees.
-    """
+    """Write suppressed file in doc format with orphan blanks between
+    entries from unrelated subtrees."""
     if not entries:
         path.write_text("")
         return
-
     with path.open("w") as f:
         prev_node: Optional[KNode] = None
         for entry in entries:
-            sym = entry.symbol
-            node = knode_index.get(sym) if sym else None
-
+            node = knode_index.get(entry.symbol) if entry.symbol else None
             if node and _needs_blank(prev_node, node):
                 f.write("\n")
-
             for cmt in entry.pre_comments:
                 f.write(cmt + "\n")
-
-            if sym and node:
-                # Write in full doc format (glyph comes from live .config)
+            if entry.symbol and node:
                 tc = f" {entry.trailing_comment}" if entry.trailing_comment else ""
-                f.write(f"{node.raw_glyph()} {node.prompt or node.name}"
-                        f" ({node.name}){tc}\n")
+                glyph = node.raw_glyph()
+                prompt = node.prompt or node.name
+                f.write(f"{glyph} {prompt} ({node.name}){tc}\n")
             elif entry.comment_text:
                 f.write(entry.comment_text + "\n")
-
             for cmt in entry.post_comments:
                 f.write(cmt + "\n")
-
             if node:
                 prev_node = node
 
@@ -1206,7 +1184,6 @@ def main():
         write_doc(doc_path, output_lines)
         print(f"Doc written → {doc_path}", file=sys.stderr)
 
-        # Remove from suppressed any symbols now in doc (conflict resolution)
         doc_syms = set(merger._eff_doc.keys())
         new_sup = [e for e in new_sup
                    if not e.symbol or e.symbol not in doc_syms]
@@ -1227,11 +1204,10 @@ def main():
         for n in all_notices:
             print(f"  + {n}", file=sys.stderr)
 
-    all_warnings = merger.warnings
-    if all_warnings:
+    if merger.warnings:
         print(file=sys.stderr)
-        print(f"{magenta('WARNINGS')} ({len(all_warnings)}):", file=sys.stderr)
-        for w in all_warnings:
+        print(f"{magenta('WARNINGS')} ({len(merger.warnings)}):", file=sys.stderr)
+        for w in merger.warnings:
             print(f"  {magenta('!')} {w}", file=sys.stderr)
 
     stats: dict = {"total": 0, "yes": 0, "module": 0, "no": 0,
