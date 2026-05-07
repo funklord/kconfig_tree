@@ -413,7 +413,7 @@ _TRAILING_CMT_RE = re.compile(r" (#.*)$")
 _BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
 _DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
 _DOTCFG_UNSET_RE = re.compile(r"^#\s+(CONFIG_\w+)\s+is not set\s*$")
-_STRUCT_LEADER   = re.compile(r"^(▶ |◆ |\[if )")
+_STRUCT_LEADER   = re.compile(r"^(▶ |◆ |--- |\[if )")
 _KCONFIG_CMT_RE  = re.compile(r"^--- (.+) ---$")
 
 
@@ -541,6 +541,19 @@ class DocFileParser:
                               RawEntry(symbol=m.group(1),
                                        trailing_comment=trailing,
                                        file_value="")))
+                continue
+
+            # Check structural leader BEFORE _DOC_SYMBOL_RE so that
+            # e.g. "◆ Link Time Optimization (LTO)" is never mis-parsed
+            # as CONFIG_LTO.
+            if _STRUCT_LEADER.match(content_clean):
+                prompt_key = _struct_prompt_key(content_clean)
+                if prompt_key:
+                    items.append(("option",
+                                  RawEntry(symbol="",
+                                           trailing_comment=trailing,
+                                           file_value="",
+                                           comment_text=prompt_key)))
                 continue
 
             ms = _DOC_SYMBOL_RE.search(content_clean)
@@ -946,6 +959,12 @@ class Merger:
     def _struct_entry(self, key: str) -> Optional[RawEntry]:
         return self._eff_struct.get(key) or self.sup.struct_index.get(key)
 
+    def _is_struct_suppressed(self, node: KNode) -> bool:
+        if self.full:
+            return False
+        key = node.prompt.strip() if node.prompt else ""
+        return bool(key) and key in self.sup.struct_index
+
 
     # ── tree walk ──────────────────────────────────────────────────────────────
 
@@ -993,7 +1012,8 @@ class Merger:
                 if self._should_emit(child):
                     return True
             elif child.kind in ("menu", "choice", "if"):
-                if self._has_visible_children(child):
+                if (not self._is_struct_suppressed(child)
+                        and self._has_visible_children(child)):
                     return True
             elif child.kind == "comment":
                 return True
@@ -1020,7 +1040,8 @@ class Merger:
                                 f"Active option not tracked: {sym} "
                                 f"(use --add-new-enabled or --add-new)")
             elif child.kind in ("menu", "choice", "if"):
-                if self._has_visible_children(child):
+                if (not self._is_struct_suppressed(child)
+                        and self._has_visible_children(child)):
                     out.append(child)
             elif child.kind == "comment":
                 out.append(child)
@@ -1107,21 +1128,26 @@ class Merger:
 
 # ── Suppressed file update ────────────────────────────────────────────────────
 
-def compute_new_suppressed(
+def prune_suppressed(
     sup:         DocFileParser,
     knode_index: dict[str, KNode],
     full:        bool,
-) -> tuple[list[RawEntry], list[str]]:
+) -> tuple[list[str], list[str]]:
+    """Prune vanished symbols from sup in-place. Clears everything if full."""
     notices: list[str] = []
     if full:
-        return [], notices
-    new_entries: list[RawEntry] = []
-    for entry in sup.ordered:
-        if entry.symbol and entry.symbol not in knode_index:
-            notices.append(f"Dropped vanished symbol from suppressed: {entry.symbol}")
-            continue
-        new_entries.append(entry)
-    return new_entries, notices
+        sup.symbol_index.clear()
+        sup.struct_index.clear()
+        sup.ordered.clear()
+        return notices, []
+    to_remove = [sym for sym in sup.symbol_index
+                 if sym not in knode_index]
+    for sym in to_remove:
+        notices.append(f"Dropped vanished symbol from suppressed: {sym}")
+        del sup.symbol_index[sym]
+    sup.ordered = [e for e in sup.ordered
+                   if not e.symbol or e.symbol in knode_index]
+    return notices, []
 
 
 # ── Emit Linux .config format ─────────────────────────────────────────────────
@@ -1165,36 +1191,25 @@ def write_doc(path: Path, lines: list[OutputLine]):
                 last_blank = False
 
 
-def write_suppressed(path: Path, entries: list[RawEntry],
-                     knode_index: dict[str, KNode]):
-    if not entries:
+def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
+                     knode_index: dict[str, KNode], full: bool):
+    """Write the suppressed file as a proper indented tree, reusing the
+    Merger tree-walk and comment-handling (mirrors doc file format).
+    """
+    if not sup.symbol_index and not sup.struct_index:
         path.write_text("")
         return
-    with path.open("w") as f:
-        prev_node: Optional[KNode] = None
-        for entry in entries:
-            node = knode_index.get(entry.symbol) if entry.symbol else None
-            if node and _needs_blank(prev_node, node):
-                f.write("\n")
-            if entry.pre_group:
-                for line in entry.pre_group.lines:
-                    f.write(line + "\n")
-            if entry.symbol and node:
-                tc     = f" {entry.trailing_comment}" if entry.trailing_comment else ""
-                glyph  = node.raw_glyph()
-                prompt = node.prompt or node.name
-                f.write(f"{glyph} {prompt} ({node.name}){tc}\n")
-            elif entry.comment_text:
-                f.write(entry.comment_text + "\n")
-            for pg in entry.post_groups:
-                if pg.blank_above:
-                    f.write("\n")
-                for line in pg.lines:
-                    f.write(line + "\n")
-                if pg.blank_below:
-                    f.write("\n")
-            if node:
-                prev_node = node
+    empty = DocFileParser(Path("/nonexistent"), knode_index)
+    sup_merger = Merger(
+        root        = root,
+        doc         = sup,
+        sup         = empty,
+        knode_index = knode_index,
+        full        = False,
+    )
+    sup_lines = sup_merger.run()
+    # Skip the first line (tree header) when writing the suppressed file
+    write_doc(path, sup_lines[1:])
 
 
 # ── Post-render depth / filter ─────────────────────────────────────────────────
@@ -1303,7 +1318,15 @@ def main():
     )
     output_lines = merger.run()
 
-    new_sup, sup_notices = compute_new_suppressed(sup, knode_index, args.full)
+    sup_notices, _ = prune_suppressed(sup, knode_index, args.full)
+
+    # Remove from suppressed any symbols now in doc (conflict resolution)
+    doc_syms = set(merger._eff_doc.keys())
+    for sym in list(sup.symbol_index.keys()):
+        if sym in doc_syms:
+            del sup.symbol_index[sym]
+    sup.ordered = [e for e in sup.ordered
+                   if not e.symbol or e.symbol not in doc_syms]
 
     show_lines = output_lines
     if args.show and (args.depth is not None or args.filter):
@@ -1317,14 +1340,10 @@ def main():
         write_doc(doc_path, output_lines)
         print(f"Doc written → {doc_path}", file=sys.stderr)
 
-        doc_syms = set(merger._eff_doc.keys())
-        new_sup = [e for e in new_sup
-                   if not e.symbol or e.symbol not in doc_syms]
-        write_suppressed(sup_path, new_sup, knode_index)
-        if args.full and not new_sup:
-            print(f"Suppressed cleared → {sup_path}", file=sys.stderr)
-        else:
-            print(f"Suppressed updated → {sup_path}", file=sys.stderr)
+        write_suppressed(sup_path, sup, root, knode_index, args.full)
+        cleared = args.full and not sup.symbol_index and not sup.struct_index
+        print(f"Suppressed {'cleared' if cleared else 'updated'} → {sup_path}",
+              file=sys.stderr)
 
     if args.show:
         for ol in show_lines:
