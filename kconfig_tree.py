@@ -813,7 +813,6 @@ class Merger:
                 if key not in self._eff_struct:
                     self._eff_struct[key] = entry
 
-        self._prev_knode: Optional[KNode] = None
 
     # ── internal push helpers ──────────────────────────────────────────────────
 
@@ -893,9 +892,6 @@ class Merger:
     def _struct_entry(self, key: str) -> Optional[RawEntry]:
         return self._eff_struct.get(key) or self.sup.struct_index.get(key)
 
-    def _maybe_orphan_blank(self, curr_node: KNode):
-        if _needs_blank(self._prev_knode, curr_node):
-            self._push_blank()
 
     # ── tree walk ──────────────────────────────────────────────────────────────
 
@@ -989,7 +985,6 @@ class Merger:
             for g in (entry.post_groups if entry else []):
                 self._emit_group(g, cmt_indent, is_pre=False)
 
-            # Structural nodes do NOT update _prev_knode
             self._recurse(node, child_pfx)
             return
 
@@ -998,8 +993,6 @@ class Merger:
         if sym in self._emitted:
             return
         self._emitted.add(sym)
-
-        self._maybe_orphan_blank(node)
 
         entry  = self._entry(sym)
         in_eff = self._in_eff_doc(sym)
@@ -1026,8 +1019,6 @@ class Merger:
         for g in (entry.post_groups if entry else []):
             self._emit_group(g, cmt_indent, is_pre=False)
 
-        # Only config/menuconfig updates _prev_knode (not structural)
-        self._prev_knode = node
 
         if node.kind == "menuconfig" and node.children:
             self._recurse(node, child_pfx)
