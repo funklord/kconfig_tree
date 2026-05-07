@@ -726,12 +726,17 @@ def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
 
 def _comment_indent(prefix: str, connector: str) -> str:
     """
-    Return the indentation string for a type-2 or type-3 comment line.
-    The comment's '#' should align with the body of the node it is anchored to.
-    Body starts at: prefix + connector + body_text
-    So comment indent = prefix + ' ' * len(connector)
+    Return the indentation for a comment anchored to a node.
+    '#' must align with the body text of the anchor node.
+
+    The anchor node's body starts at column len(prefix) + len(connector).
+    The continuation prefix that visually belongs under that node is:
+      prefix + PIPE  when connector == TEE  (node has more siblings after it)
+      prefix + BLANK when connector == LAST (node is the last child)
+    Both PIPE and BLANK are the same width as TEE/LAST, so '#' lands on
+    the same column as the body text.
     """
-    return prefix + " " * len(connector)
+    return prefix + (BLANK if connector == LAST else PIPE)
 
 
 def _emit_comment_group(push_fn, push_blank_fn,
