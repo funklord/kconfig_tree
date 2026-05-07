@@ -979,6 +979,9 @@ class Merger:
     def run(self) -> list[OutputLine]:
         hdr = f"⚙ {self.root.prompt or 'Linux Kernel Configuration'}"
         self._push(hdr, bold(cyan(hdr)))
+        # Mark the root as having its header emitted so root-level
+        # config nodes don't trigger the suppressed-parent blank.
+        self._struct_header_emitted.add(id(self.root))
         self._check_conflicts()
         # Emit rootless dead entries (no known anchor above them) as plain
         # top-level comments before the tree, so they are visible and preserved.
@@ -1126,7 +1129,9 @@ class Merger:
             and id(parent) not in self._struct_header_emitted
         )
         new_parent_group = (parent is not self._prev_emitted_parent)
-        if parent_suppressed and new_parent_group and self._emitted:
+        # len > 1 because sym was already added above — we want
+        # "something was emitted before this node", not "this node exists".
+        if parent_suppressed and new_parent_group and len(self._emitted) > 1:
             self._push_blank()
 
         entry  = self._entry(sym)
