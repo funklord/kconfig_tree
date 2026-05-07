@@ -1191,25 +1191,78 @@ def write_doc(path: Path, lines: list[OutputLine]):
                 last_blank = False
 
 
+def _collect_suppressed_in_order(
+    node:       KNode,
+    sup:        "DocFileParser",
+    out:        list,
+):
+    """Walk Kconfig tree depth-first, collecting (KNode, RawEntry) pairs
+    for nodes that are explicitly in the suppressed file."""
+    sym = node.symbol()
+    key = node.prompt.strip() if node.prompt else ""
+    if sym and sym in sup.symbol_index:
+        out.append((node, sup.symbol_index[sym]))
+    elif key and key in sup.struct_index:
+        out.append((node, sup.struct_index[key]))
+    for child in node.children:
+        _collect_suppressed_in_order(child, sup, out)
+
+
 def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
                      knode_index: dict[str, KNode], full: bool):
-    """Write the suppressed file as a proper indented tree, reusing the
-    Merger tree-walk and comment-handling (mirrors doc file format).
+    """Write the suppressed file in Kconfig tree order.
+
+    Only entries that the user explicitly put in the suppressed file are
+    written — structural parent nodes are NOT added automatically (that
+    caused menus to be incorrectly suppressed from the main doc on re-read).
+
+    Entries are written in flat doc format (no tree-prefix indentation that
+    would imply parents that aren't there).  Blank lines are inserted between
+    entries from unrelated subtrees so groups are visually clear.
+    Comments attached to each entry are preserved.
     """
     if not sup.symbol_index and not sup.struct_index:
         path.write_text("")
         return
-    empty = DocFileParser(Path("/nonexistent"), knode_index)
-    sup_merger = Merger(
-        root        = root,
-        doc         = sup,
-        sup         = empty,
-        knode_index = knode_index,
-        full        = False,
-    )
-    sup_lines = sup_merger.run()
-    # Skip the first line (tree header) when writing the suppressed file
-    write_doc(path, sup_lines[1:])
+
+    ordered: list[tuple[KNode, "RawEntry"]] = []
+    _collect_suppressed_in_order(root, sup, ordered)
+
+    with path.open("w") as f:
+        prev_knode: Optional[KNode] = None
+        for node, entry in ordered:
+            # Blank between config/menuconfig nodes from different subtrees
+            if node.kind in ("config", "menuconfig"):
+                if _needs_blank(prev_knode, node):
+                    f.write("\n")
+                prev_knode = node
+
+            # Pre-group comments
+            if entry.pre_group:
+                if entry.pre_group.blank_above:
+                    f.write("\n")
+                for line in entry.pre_group.lines:
+                    f.write(line + "\n")
+
+            # The node line itself (flat — no tree prefix)
+            tc = f" {entry.trailing_comment}" if entry.trailing_comment else ""
+            if node.symbol():
+                glyph  = node.raw_glyph()
+                prompt = node.prompt or node.name
+                f.write(f"{glyph} {prompt} ({node.name}){tc}\n")
+            elif entry.comment_text:
+                # Structural entry (choice/menu in suppressed)
+                body = _plain_body(node)
+                f.write(f"{body}{tc}\n")
+
+            # Post-group comments
+            for pg in entry.post_groups:
+                if pg.blank_above:
+                    f.write("\n")
+                for line in pg.lines:
+                    f.write(line + "\n")
+                if pg.blank_below:
+                    f.write("\n")
 
 
 # ── Post-render depth / filter ─────────────────────────────────────────────────
@@ -1385,7 +1438,7 @@ def main():
         f"{bold('Doc')}:     "
         f"{len(tracked)} tracked  "
         f"({active_tracked} active)  "
-        f"{len([e for e in new_sup if e.symbol])} suppressed",
+        f"{len(sup.symbol_index)} suppressed",
         file=sys.stderr,
     )
 
