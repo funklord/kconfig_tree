@@ -855,6 +855,12 @@ class Merger:
 
         self._emitted:        set[str] = set()
         self._struct_emitted: set[int] = set()
+        # For blank-between-different-parents logic:
+        # _prev_parent   — direct Kconfig parent of last emitted config/menuconfig
+        # _prev_had_struct — True if a structural header was emitted since the
+        #                    last config/menuconfig (provides its own separation)
+        self._prev_parent:     Optional[KNode] = None
+        self._prev_had_struct: bool = True   # suppress blank before first item
 
         self._eff_doc:    dict[str, RawEntry] = dict(doc.symbol_index)
         self._eff_struct: dict[str, RawEntry] = dict(doc.struct_index)
@@ -1012,8 +1018,9 @@ class Merger:
                 if self._should_emit(child):
                     return True
             elif child.kind in ("menu", "choice", "if"):
-                if (not self._is_struct_suppressed(child)
-                        and self._has_visible_children(child)):
+                # Suppressed structural nodes: their header is hidden but
+                # their children are still visible — so we still recurse.
+                if self._has_visible_children(child):
                     return True
             elif child.kind == "comment":
                 return True
@@ -1040,8 +1047,10 @@ class Merger:
                                 f"Active option not tracked: {sym} "
                                 f"(use --add-new-enabled or --add-new)")
             elif child.kind in ("menu", "choice", "if"):
-                if (not self._is_struct_suppressed(child)
-                        and self._has_visible_children(child)):
+                # Always include structural nodes that have visible children,
+                # even if suppressed — the header is skipped in _emit_child
+                # but the children still appear.
+                if self._has_visible_children(child):
                     out.append(child)
             elif child.kind == "comment":
                 out.append(child)
@@ -1064,10 +1073,19 @@ class Merger:
         # ── structural nodes ───────────────────────────────────────────────────
         if node.kind in ("menu", "choice", "if", "comment"):
             nid = id(node)
+            suppressed = self._is_struct_suppressed(node)
             if nid in self._struct_emitted:
                 self._recurse(node, child_pfx)
                 return
             self._struct_emitted.add(nid)
+
+            if suppressed:
+                # Header line is suppressed: no header emitted, but children
+                # still appear. Mark that no structural separator was emitted
+                # so that the blank-between-different-parents logic fires.
+                self._prev_had_struct = False
+                self._recurse(node, child_pfx)
+                return
 
             key   = node.prompt.strip() if node.prompt else ""
             entry = self._struct_entry(key)
@@ -1084,6 +1102,8 @@ class Merger:
             for g in (entry.post_groups if entry else []):
                 self._emit_group(g, cmt_indent, is_pre=False)
 
+            # A structural header was emitted — provides its own separation.
+            self._prev_had_struct = True
             self._recurse(node, child_pfx)
             return
 
@@ -1092,6 +1112,14 @@ class Merger:
         if sym in self._emitted:
             return
         self._emitted.add(sym)
+
+        # Blank between nodes with different direct parents, but only when
+        # no structural header was emitted between them (that provides its
+        # own visual separation already).
+        if (not self._prev_had_struct
+                and self._prev_parent is not None
+                and node.parent is not self._prev_parent):
+            self._push_blank()
 
         entry  = self._entry(sym)
         in_eff = self._in_eff_doc(sym)
@@ -1121,6 +1149,10 @@ class Merger:
         # Dead entries anchored to this symbol (unknown symbols with comments)
         for dead_entry in self._anchor_map.get(sym, []):
             self._emit_dead_comment(dead_entry, prefix, connector)
+
+        # Update parent-tracking state
+        self._prev_parent     = node.parent
+        self._prev_had_struct = False
 
         if node.kind == "menuconfig" and node.children:
             self._recurse(node, child_pfx)
@@ -1197,13 +1229,19 @@ def _collect_suppressed_in_order(
     out:        list,
 ):
     """Walk Kconfig tree depth-first, collecting (KNode, RawEntry) pairs
-    for nodes that are explicitly in the suppressed file."""
+    for nodes that are explicitly in the suppressed file.
+    config/menuconfig nodes are only matched against symbol_index.
+    Structural nodes (menu/choice/if/comment) are matched against struct_index.
+    This prevents a config whose prompt text happens to equal a struct key
+    from being incorrectly collected."""
     sym = node.symbol()
     key = node.prompt.strip() if node.prompt else ""
-    if sym and sym in sup.symbol_index:
-        out.append((node, sup.symbol_index[sym]))
-    elif key and key in sup.struct_index:
-        out.append((node, sup.struct_index[key]))
+    if node.kind in ("config", "menuconfig"):
+        if sym and sym in sup.symbol_index:
+            out.append((node, sup.symbol_index[sym]))
+    elif node.kind in ("menu", "choice", "if", "comment"):
+        if key and key in sup.struct_index:
+            out.append((node, sup.struct_index[key]))
     for child in node.children:
         _collect_suppressed_in_order(child, sup, out)
 
@@ -1228,14 +1266,35 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
     ordered: list[tuple[KNode, "RawEntry"]] = []
     _collect_suppressed_in_order(root, sup, ordered)
 
+    # Build a lookup: KNode id → (index in ordered, parent KNode)
+    # so we can determine connector (last vs not-last within same parent group).
+    # Entries with the same direct parent are a group; the last in each group
+    # gets └─, others get ├─.
+    from collections import defaultdict
+    parent_groups: dict[int, list[int]] = defaultdict(list)
+    for idx, (node, _) in enumerate(ordered):
+        parent_id = id(node.parent) if node.parent else 0
+        parent_groups[parent_id].append(idx)
+    # Map each index to its connector
+    connector_for: dict[int, str] = {}
+    for group in parent_groups.values():
+        for i, idx in enumerate(group):
+            connector_for[idx] = LAST if i == len(group) - 1 else TEE
+
     with path.open("w") as f:
-        prev_knode: Optional[KNode] = None
-        for node, entry in ordered:
-            # Blank between config/menuconfig nodes from different subtrees
-            if node.kind in ("config", "menuconfig"):
-                if _needs_blank(prev_knode, node):
-                    f.write("\n")
-                prev_knode = node
+        prev_parent: Optional[KNode] = None
+        prev_had_struct = True   # suppress blank before first item
+        for idx, (node, entry) in enumerate(ordered):
+            is_struct = node.kind in ("menu", "choice", "if", "comment")
+            connector = connector_for.get(idx, LAST)
+
+            # Blank between entries with different direct parents
+            # (same rule for both config and structural nodes).
+            # Suppress blank before the very first item (prev_had_struct starts True).
+            if (not prev_had_struct
+                    and prev_parent is not None
+                    and node.parent is not prev_parent):
+                f.write("\n")
 
             # Pre-group comments
             if entry.pre_group:
@@ -1244,16 +1303,20 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
                 for line in entry.pre_group.lines:
                     f.write(line + "\n")
 
-            # The node line itself (flat — no tree prefix)
+            # Node line in same format as doc file (no tree prefix — nodes
+            # from different depths would need parent headers to be meaningful,
+            # and we don't add those).
             tc = f" {entry.trailing_comment}" if entry.trailing_comment else ""
             if node.symbol():
                 glyph  = node.raw_glyph()
                 prompt = node.prompt or node.name
-                f.write(f"{glyph} {prompt} ({node.name}){tc}\n")
-            elif entry.comment_text:
-                # Structural entry (choice/menu in suppressed)
+                f.write(f"{connector}{glyph} {prompt} ({node.name}){tc}\n")
+                prev_parent     = node.parent
+                prev_had_struct = False
+            elif is_struct:
                 body = _plain_body(node)
-                f.write(f"{body}{tc}\n")
+                f.write(f"{connector}{body}{tc}\n")
+                prev_had_struct = True
 
             # Post-group comments
             for pg in entry.post_groups:
