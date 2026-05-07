@@ -391,8 +391,9 @@ def build_knode_index(node: KNode,
                       idx: Optional[dict] = None) -> dict[str, KNode]:
     if idx is None:
         idx = {}
-    if node.symbol():
-        idx[node.symbol()] = node
+    sym = node.symbol()
+    if sym and sym not in idx:   # keep first definition; Kconfig allows
+        idx[sym] = node          # config + menuconfig with the same name
     for c in node.children:
         build_knode_index(c, idx)
     return idx
@@ -407,6 +408,7 @@ def build_knode_index(node: KNode,
 #   4. Freestanding (post, blank above+below) → post_groups, is_freestanding()
 
 _DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
+_SYMBOL_TAG_RE   = re.compile(r"\((\w+)\)")  # tag only, no trailing
 _TRAILING_CMT_RE = re.compile(r" (#.*)$")
 _BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
 _DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
@@ -440,6 +442,23 @@ class RawEntry:
 
 
 def _extract_trailing(content: str) -> tuple[str, str]:
+    """Return (content_without_trailing_comment, trailing_comment).
+
+    When a (SYMBOL) tag is present we only search for a trailing comment
+    AFTER the tag, so that '#' characters inside the prompt text
+    (e.g. 'Kernel support for scripts starting with #!') are not mistaken
+    for a trailing comment and the (SYMBOL) tag is not swallowed.
+
+    Uses _SYMBOL_TAG_RE (no trailing group) to find the tag position,
+    then _TRAILING_CMT_RE on the text after the tag.
+    """
+    tag_match = _SYMBOL_TAG_RE.search(content)
+    if tag_match:
+        after = content[tag_match.end():]
+        m = _TRAILING_CMT_RE.search(after)
+        if m:
+            return content[:tag_match.end() + m.start()], m.group(1)
+        return content, ""
     m = _TRAILING_CMT_RE.search(content)
     if m:
         return content[:m.start()], m.group(1)
@@ -469,6 +488,7 @@ class DocFileParser:
         self.symbol_index: dict[str, RawEntry] = {}
         self.struct_index: dict[str, RawEntry] = {}
         self.ordered: list[RawEntry] = []
+        self.dead_entries: list[RawEntry] = []  # unknown symbols, kept as comments
         self.warnings: list[str] = []
         self._parse()
 
@@ -620,12 +640,16 @@ class DocFileParser:
                     self.ordered.append(entry)
 
         # ── Pass 4: validate against Kconfig tree ─────────────────────────────
+        # Unknown symbols are not deleted — they are moved to dead_entries and
+        # re-emitted as commented-out stubs so user comments are preserved.
 
         for sym in list(self.symbol_index.keys()):
             if sym not in self.knode_index:
                 self.warnings.append(
                     f"Symbol {sym} in {self.path.name} not found in "
-                    f"Kconfig tree — removed")
+                    f"Kconfig tree — kept as comment stub")
+                entry = self.symbol_index[sym]
+                self.dead_entries.append(entry)
                 del self.symbol_index[sym]
                 self.ordered = [e for e in self.ordered if e.symbol != sym]
 
@@ -900,7 +924,37 @@ class Merger:
         self._push(hdr, bold(cyan(hdr)))
         self._check_conflicts()
         self._recurse(self.root, prefix="")
+        self._emit_dead_entries()
         return self.output
+
+    def _emit_dead_entries(self):
+        """Emit unknown symbols (not in Kconfig tree) as commented-out stubs
+        with their attached comments preserved, grouped at the end of output."""
+        sources = self.doc.dead_entries
+        if self.full:
+            sources = sources + self.sup.dead_entries
+        if not sources:
+            return
+        self._push_blank()
+        self._push(
+            "# ── Unknown symbols (not in current Kconfig tree) ─────────────",
+            gray("# ── Unknown symbols (not in current Kconfig tree) ─────────────"),
+        )
+        for entry in sources:
+            sym = entry.symbol
+            tc  = f" {entry.trailing_comment}" if entry.trailing_comment else ""
+            stub_p = f"# [unknown: {sym}]{tc}"
+            stub_c = magenta(stub_p)
+            if entry.pre_group:
+                self._push_blank()
+                for line in entry.pre_group.lines:
+                    self._push(line, gray(line))
+            self._push(stub_p, stub_c)
+            for g in entry.post_groups:
+                for line in g.lines:
+                    self._push(line, gray(line))
+                if g.blank_below:
+                    self._push_blank()
 
     def _check_conflicts(self):
         for sym in self.doc.symbol_index:
