@@ -103,8 +103,8 @@ def strip_ansi(s: str) -> str:
 # ── Tree drawing ───────────────────────────────────────────────────────────────
 
 PIPE  = "│ "
-TEE   = "├─ "
-LAST  = "└─ "
+TEE   = "├─"
+LAST  = "└─"
 BLANK = "  "
 
 _TREE_CHARS = set("│├└─ ")
