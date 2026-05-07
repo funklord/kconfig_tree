@@ -439,6 +439,7 @@ class RawEntry:
     blank_before: bool = False
     pre_group:  Optional[CommentGroup] = None  # type-3
     post_groups: list[CommentGroup] = field(default_factory=list)  # type-2 and/or type-4
+    anchor_above_sym: str = ""  # for dead entries: last known symbol above in doc
 
 
 def _extract_trailing(content: str) -> tuple[str, str]:
@@ -640,18 +641,34 @@ class DocFileParser:
                     self.ordered.append(entry)
 
         # ── Pass 4: validate against Kconfig tree ─────────────────────────────
-        # Unknown symbols are not deleted — they are moved to dead_entries and
-        # re-emitted as commented-out stubs so user comments are preserved.
+        # Unknown symbols:
+        #   - with attached comments → moved to dead_entries, emitted inline as
+        #     type-2 anchored comments beside their preceding known option
+        #   - without comments       → silently dropped (no warning, no stub)
 
-        for sym in list(self.symbol_index.keys()):
-            if sym not in self.knode_index:
+        unknown_syms = {sym for sym in self.symbol_index
+                        if sym not in self.knode_index}
+
+        # Record anchor: last known symbol before each unknown entry in doc order
+        last_known = ""
+        for entry in self.ordered:
+            if entry.symbol and entry.symbol not in unknown_syms:
+                last_known = entry.symbol
+            elif entry.symbol in unknown_syms:
+                entry.anchor_above_sym = last_known
+
+        for sym in unknown_syms:
+            entry = self.symbol_index[sym]
+            has_comments = bool(entry.pre_group or entry.post_groups
+                                or entry.trailing_comment)
+            if has_comments:
+                self.dead_entries.append(entry)
                 self.warnings.append(
                     f"Symbol {sym} in {self.path.name} not found in "
-                    f"Kconfig tree — kept as comment stub")
-                entry = self.symbol_index[sym]
-                self.dead_entries.append(entry)
-                del self.symbol_index[sym]
-                self.ordered = [e for e in self.ordered if e.symbol != sym]
+                    f"Kconfig tree — converted to inline comment")
+            # else: silently dropped
+            del self.symbol_index[sym]
+        self.ordered = [e for e in self.ordered if e.symbol not in unknown_syms]
 
         # ── Pass 5: value mismatch warnings ───────────────────────────────────
 
@@ -837,6 +854,19 @@ class Merger:
                 if key not in self._eff_struct:
                     self._eff_struct[key] = entry
 
+        # Build anchor map for dead entries (unknown symbols with comments)
+        all_dead = list(doc.dead_entries)
+        if full:
+            all_dead += sup.dead_entries
+        self._anchor_map:   dict[str, list[RawEntry]] = {}
+        self._rootless_dead: list[RawEntry] = []
+        for dead_entry in all_dead:
+            anchor = dead_entry.anchor_above_sym
+            if anchor:
+                self._anchor_map.setdefault(anchor, []).append(dead_entry)
+            else:
+                self._rootless_dead.append(dead_entry)
+
 
     # ── internal push helpers ──────────────────────────────────────────────────
 
@@ -923,38 +953,32 @@ class Merger:
         hdr = f"⚙ {self.root.prompt or 'Linux Kernel Configuration'}"
         self._push(hdr, bold(cyan(hdr)))
         self._check_conflicts()
+        # Emit rootless dead entries (no known anchor above them) as plain
+        # top-level comments before the tree, so they are visible and preserved.
+        for dead_entry in self._rootless_dead:
+            self._emit_dead_comment(dead_entry, prefix="", connector="")
         self._recurse(self.root, prefix="")
-        self._emit_dead_entries()
         return self.output
 
-    def _emit_dead_entries(self):
-        """Emit unknown symbols (not in Kconfig tree) as commented-out stubs
-        with their attached comments preserved, grouped at the end of output."""
-        sources = self.doc.dead_entries
-        if self.full:
-            sources = sources + self.sup.dead_entries
-        if not sources:
-            return
-        self._push_blank()
-        self._push(
-            "# ── Unknown symbols (not in current Kconfig tree) ─────────────",
-            gray("# ── Unknown symbols (not in current Kconfig tree) ─────────────"),
-        )
-        for entry in sources:
-            sym = entry.symbol
-            tc  = f" {entry.trailing_comment}" if entry.trailing_comment else ""
-            stub_p = f"# [unknown: {sym}]{tc}"
-            stub_c = magenta(stub_p)
-            if entry.pre_group:
-                self._push_blank()
-                for line in entry.pre_group.lines:
-                    self._push(line, gray(line))
-            self._push(stub_p, stub_c)
-            for g in entry.post_groups:
-                for line in g.lines:
-                    self._push(line, gray(line))
-                if g.blank_below:
-                    self._push_blank()
+    def _emit_dead_comment(self, entry: RawEntry,
+                           prefix: str, connector: str):
+        """Emit an unknown symbol as a type-2 anchored comment at the
+        indentation of its anchor option (prefix + connector-width spaces)."""
+        indent = _comment_indent(prefix, connector)
+        sym    = entry.symbol
+        tc     = f" {entry.trailing_comment}" if entry.trailing_comment else ""
+        # Pre-group (if any): type-3 style, same indent
+        if entry.pre_group:
+            for line in entry.pre_group.lines:
+                self._push(f"{indent}{line}", f"{indent}{gray(line)}")
+        # The symbol itself as a commented-out line
+        stub_p = f"{indent}# {sym}{tc}"
+        stub_c = f"{indent}{magenta(f'# {sym}{tc}')}"
+        self._push(stub_p, stub_c)
+        # Post-groups: type-2 style, same indent, no surrounding blanks
+        for g in entry.post_groups:
+            for line in g.lines:
+                self._push(f"{indent}{line}", f"{indent}{gray(line)}")
 
     def _check_conflicts(self):
         for sym in self.doc.symbol_index:
@@ -1073,6 +1097,9 @@ class Merger:
         for g in (entry.post_groups if entry else []):
             self._emit_group(g, cmt_indent, is_pre=False)
 
+        # Dead entries anchored to this symbol (unknown symbols with comments)
+        for dead_entry in self._anchor_map.get(sym, []):
+            self._emit_dead_comment(dead_entry, prefix, connector)
 
         if node.kind == "menuconfig" and node.children:
             self._recurse(node, child_pfx)
