@@ -1022,15 +1022,22 @@ class Merger:
                     f"Conflict: {sym} in both doc and suppressed "
                     f"— doc wins, removing from suppressed")
 
+    def _is_struct_in_doc(self, node: KNode) -> bool:
+        """True if this structural node is explicitly in the effective doc.
+        Such nodes are always kept even if all their children are suppressed."""
+        key = node.prompt.strip() if node.prompt else ""
+        return bool(key) and key in self._eff_struct
+
     def _has_visible_children(self, node: KNode) -> bool:
         for child in node.children:
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
                     return True
             elif child.kind in ("menu", "choice", "if"):
-                # Suppressed structural nodes: their header is hidden but
-                # their children are still visible — so we still recurse.
-                if self._has_visible_children(child):
+                # A structural node is visible if it is explicitly in the
+                # doc (even with no children) OR has visible descendants.
+                if (self._is_struct_in_doc(child)
+                        or self._has_visible_children(child)):
                     return True
             elif child.kind == "comment":
                 return True
@@ -1057,10 +1064,10 @@ class Merger:
                                 f"Active option not tracked: {sym} "
                                 f"(use --add-new-enabled or --add-new)")
             elif child.kind in ("menu", "choice", "if"):
-                # Always include structural nodes that have visible children,
-                # even if suppressed — the header is skipped in _emit_child
-                # but the children still appear.
-                if self._has_visible_children(child):
+                # Include structural nodes that are explicitly in the doc
+                # (even if childless) OR have visible descendants.
+                if (self._is_struct_in_doc(child)
+                        or self._has_visible_children(child)):
                     out.append(child)
             elif child.kind == "comment":
                 out.append(child)
