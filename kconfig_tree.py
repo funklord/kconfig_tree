@@ -435,7 +435,8 @@ class RawEntry:
     symbol: str            # CONFIG_FOO or ""
     trailing_comment: str  # type-1, or ""
     file_value: str        # from =y / is-not-set, or ""
-    comment_text: str = "" # normalised prompt key for structural lines
+    comment_text: str = "" # own-prompt (later upgraded to two-level key)
+    depth: int = 0           # tree depth of this line in the doc file
     blank_before: bool = False
     pre_group:  Optional[CommentGroup] = None  # type-3
     post_groups: list[CommentGroup] = field(default_factory=list)  # type-2 and/or type-4
@@ -488,6 +489,22 @@ def _struct_prompt_key(content_clean: str) -> str:
     if s.endswith(" ---"):              # trailing --- after leader strip
         s = s[:-4]
     return s.strip()
+
+
+def _struct_node_key(node: KNode) -> str:
+    """Two-level key: 'nearest_structural_parent_prompt::own_prompt'.
+    If no structural parent exists above root, returns just own_prompt.
+    This disambiguates same-named nodes in different menus.
+    """
+    own = node.prompt.strip() if node.prompt else ""
+    p = node.parent
+    while p:
+        if p.parent is None:  # stop before synthetic root
+            break
+        if p.kind in ("menu", "choice", "if", "comment") and p.prompt:
+            return f"{p.prompt.strip()}::{own}"
+        p = p.parent
+    return own
 
 
 class DocFileParser:
@@ -571,7 +588,8 @@ class DocFileParser:
                                   RawEntry(symbol="",
                                            trailing_comment=trailing,
                                            file_value="",
-                                           comment_text=prompt_key)))
+                                           comment_text=prompt_key,
+                                           depth=_depth_of(line))))
                 continue
 
             ms = _DOC_SYMBOL_RE.search(content_clean)
@@ -588,7 +606,8 @@ class DocFileParser:
                               RawEntry(symbol="",
                                        trailing_comment=trailing,
                                        file_value="",
-                                       comment_text=prompt_key)))
+                                       comment_text=prompt_key,
+                                       depth=_depth_of(line))))
                 continue
 
             items.append(("comment", content))
@@ -655,6 +674,11 @@ class DocFileParser:
                 # else: discard
 
         # ── Pass 3: index ─────────────────────────────────────────────────────
+        # Structural entries use two-level key 'parent_prompt::own_prompt' to
+        # disambiguate identically-named nodes in different menus.
+        # We reconstruct the parent from a depth stack of (depth, own_prompt).
+
+        depth_stack: list[tuple[int, str]] = []
 
         for entry in option_entries:
             if entry.symbol:
@@ -666,10 +690,18 @@ class DocFileParser:
                         f"Duplicate symbol {entry.symbol} in "
                         f"{self.path.name} — keeping first")
             elif entry.comment_text:
-                key = entry.comment_text
+                own = entry.comment_text
+                d   = entry.depth
+                # Pop entries at same or deeper depth
+                while depth_stack and depth_stack[-1][0] >= d:
+                    depth_stack.pop()
+                parent_prompt = depth_stack[-1][1] if depth_stack else ""
+                key = f"{parent_prompt}::{own}" if parent_prompt else own
+                entry.comment_text = key  # upgrade to two-level key in-place
                 if key not in self.struct_index:
                     self.struct_index[key] = entry
                     self.ordered.append(entry)
+                depth_stack.append((d, own))
 
         # ── Pass 4: validate against Kconfig tree ─────────────────────────────
         # Unknown symbols:
@@ -987,14 +1019,14 @@ class Merger:
     def _entry(self, sym: str) -> Optional[RawEntry]:
         return self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
 
-    def _struct_entry(self, key: str) -> Optional[RawEntry]:
+    def _struct_entry(self, node: KNode) -> Optional[RawEntry]:
+        key = _struct_node_key(node)
         return self._eff_struct.get(key) or self.sup.struct_index.get(key)
 
     def _is_struct_suppressed(self, node: KNode) -> bool:
         if self.full:
             return False
-        key = node.prompt.strip() if node.prompt else ""
-        return bool(key) and key in self.sup.struct_index
+        return _struct_node_key(node) in self.sup.struct_index
 
 
     # ── tree walk ──────────────────────────────────────────────────────────────
@@ -1043,8 +1075,7 @@ class Merger:
     def _is_struct_in_doc(self, node: KNode) -> bool:
         """True if this structural node is explicitly in the effective doc.
         Such nodes are always kept even if all their children are suppressed."""
-        key = node.prompt.strip() if node.prompt else ""
-        return bool(key) and key in self._eff_struct
+        return _struct_node_key(node) in self._eff_struct
 
     def _has_visible_children(self, node: KNode) -> bool:
         for child in node.children:
@@ -1121,8 +1152,7 @@ class Merger:
                 self._recurse(node, child_pfx)
                 return
 
-            key   = node.prompt.strip() if node.prompt else ""
-            entry = self._struct_entry(key)
+            entry = self._struct_entry(node)
 
             # Type-3 pre-comment (blank above + node below)
             if entry and entry.pre_group:
@@ -1277,7 +1307,6 @@ def _walk_suppressed(
     at the correct tree depth.  Parent nodes that are NOT in the suppressed
     index are silently skipped but their depth is still accumulated."""
     sym = node.symbol()
-    key = node.prompt.strip() if node.prompt else ""
 
     # Determine connector for this node among its siblings
     if parent_children:
@@ -1292,9 +1321,11 @@ def _walk_suppressed(
     if node.kind in ("config", "menuconfig") and sym in sup.symbol_index:
         entry  = sup.symbol_index[sym]
         in_sup = True
-    elif node.kind in ("menu", "choice", "if", "comment") and key in sup.struct_index:
-        entry  = sup.struct_index[key]
-        in_sup = True
+    elif node.kind in ("menu", "choice", "if", "comment"):
+        nkey = _struct_node_key(node)
+        if nkey in sup.struct_index:
+            entry  = sup.struct_index[nkey]
+            in_sup = True
 
     if in_sup:
         out.append((node, entry, prefix, connector))
