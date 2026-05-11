@@ -467,8 +467,26 @@ def _extract_trailing(content: str) -> tuple[str, str]:
 
 
 def _struct_prompt_key(content_clean: str) -> str:
+    """Normalise a structural doc line's content to the key used by the
+    Merger (= KNode.prompt.strip()) so that struct_index lookups match.
+
+    Display format → KNode.prompt:
+      ▶ General setup          → General setup
+      ◆ Kernel compression     → (choice)
+      --- Some comment ---     → Some comment
+      [if CEPH_FS]             → if CEPH_FS   (must keep 'if ' prefix)
+    """
+    # [if EXPR] blocks: strip enclosing brackets, keep 'if EXPR' intact
+    # so the key matches KNode.prompt which is stored as 'if EXPR'.
+    if content_clean.startswith("[if "):
+        inner = content_clean[1:]  # strip leading [
+        if inner.endswith("]"):
+            inner = inner[:-1]     # strip trailing ]
+        return inner.strip()
     s = _STRUCT_LEADER.sub("", content_clean, count=1)
-    s = _KCONFIG_CMT_RE.sub(r"\1", s)
+    s = _KCONFIG_CMT_RE.sub(r"\1", s)  # '--- text ---' full match
+    if s.endswith(" ---"):              # trailing --- after leader strip
+        s = s[:-4]
     return s.strip()
 
 
