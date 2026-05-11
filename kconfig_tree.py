@@ -1297,7 +1297,8 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
 
     # Collect (node, entry, prefix, connector) in Kconfig tree order
     ordered: list[tuple] = []
-    _walk_suppressed(root, sup, "", root.children, ordered)
+    for child in root.children:
+        _walk_suppressed(child, sup, "", root.children, ordered)
 
     # Which node ids are explicitly in the suppressed file?
     sup_node_ids: set[int] = {id(node) for node, *_ in ordered}
