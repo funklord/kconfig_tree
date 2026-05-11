@@ -399,6 +399,25 @@ def build_knode_index(node: KNode,
     return idx
 
 
+def build_struct_knode_index(
+        node: KNode,
+        idx:  Optional[dict] = None) -> dict[str, list[KNode]]:
+    """Build own_prompt → [KNode, ...] index for structural nodes.
+    Used by DocFileParser to resolve single-level prompt strings to the
+    correct two-level key via _struct_node_key, even when the parent node
+    is absent from the doc/suppressed file.
+    Skips the synthetic root (parent == None).
+    """
+    if idx is None:
+        idx = {}
+    if (node.kind in ("menu", "choice", "if", "comment")
+            and node.prompt and node.parent is not None):
+        idx.setdefault(node.prompt.strip(), []).append(node)
+    for c in node.children:
+        build_struct_knode_index(c, idx)
+    return idx
+
+
 # ── Doc / suppressed file parser ───────────────────────────────────────────────
 #
 # Four comment types (stored in RawEntry):
@@ -518,9 +537,11 @@ class DocFileParser:
       warnings     : list[str]
     """
 
-    def __init__(self, path: Path, knode_index: dict[str, KNode]):
+    def __init__(self, path: Path, knode_index: dict[str, KNode],
+                 struct_knode_index: Optional[dict[str, list[KNode]]] = None):
         self.path = path
         self.knode_index = knode_index
+        self.struct_knode_index: dict[str, list[KNode]] = struct_knode_index or {}
         self.symbol_index: dict[str, RawEntry] = {}
         self.struct_index: dict[str, RawEntry] = {}
         self.ordered: list[RawEntry] = []
@@ -695,8 +716,20 @@ class DocFileParser:
                 # Pop entries at same or deeper depth
                 while depth_stack and depth_stack[-1][0] >= d:
                     depth_stack.pop()
-                parent_prompt = depth_stack[-1][1] if depth_stack else ""
-                key = f"{parent_prompt}::{own}" if parent_prompt else own
+
+                matching = self.struct_knode_index.get(own, [])
+                if len(matching) == 1:
+                    # Unambiguous: use Kconfig tree to get the correct key.
+                    # This is the main fix: works even when the parent node
+                    # is absent from the file (common in suppressed files).
+                    key = _struct_node_key(matching[0])
+                else:
+                    # Duplicate or unknown prompt: fall back to depth stack.
+                    # For duplicates the user needs to keep the parent in
+                    # the file to give context; otherwise ambiguous.
+                    parent_prompt = depth_stack[-1][1] if depth_stack else ""
+                    key = f"{parent_prompt}::{own}" if parent_prompt else own
+
                 entry.comment_text = key  # upgrade to two-level key in-place
                 if key not in self.struct_index:
                     self.struct_index[key] = entry
@@ -1491,13 +1524,15 @@ def main():
     annotate_tree(root, cfg)
     knode_index = build_knode_index(root)
 
+    struct_knode_index = build_struct_knode_index(root)
+
     if doc_path.exists():
         print(f"Reading {doc_path} …", file=sys.stderr)
-    doc = DocFileParser(doc_path, knode_index)
+    doc = DocFileParser(doc_path, knode_index, struct_knode_index)
 
     if sup_path.exists():
         print(f"Reading {sup_path} …", file=sys.stderr)
-    sup = DocFileParser(sup_path, knode_index)
+    sup = DocFileParser(sup_path, knode_index, struct_knode_index)
 
     merger = Merger(
         root        = root,
