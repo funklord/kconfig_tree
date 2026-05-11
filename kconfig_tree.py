@@ -719,14 +719,37 @@ class DocFileParser:
 
                 matching = self.struct_knode_index.get(own, [])
                 if len(matching) == 1:
-                    # Unambiguous: use Kconfig tree to get the correct key.
-                    # This is the main fix: works even when the parent node
-                    # is absent from the file (common in suppressed files).
+                    # Unambiguous: Kconfig tree gives us the correct key
+                    # even when parent node is absent from the file.
                     key = _struct_node_key(matching[0])
+                elif len(matching) > 1:
+                    # Duplicate prompt: try sibling-symbol disambiguation.
+                    # Find the nearest preceding CONFIG_ symbol in the file
+                    # and check which matching KNode has it as a sibling
+                    # (same Kconfig parent). This handles the common case
+                    # where a choice/menu follows a config in the same menu.
+                    last_sym = next(
+                        (e.symbol for e in reversed(option_entries)
+                         if e.symbol), "")
+                    resolved = None
+                    if last_sym:
+                        ref_knode = self.knode_index.get(last_sym)
+                        if ref_knode:
+                            sibling_matches = [
+                                m for m in matching
+                                if m.parent is ref_knode.parent
+                                or m.parent is ref_knode
+                            ]
+                            if len(sibling_matches) == 1:
+                                resolved = sibling_matches[0]
+                    if resolved:
+                        key = _struct_node_key(resolved)
+                    else:
+                        # Still ambiguous: depth-stack fallback
+                        parent_prompt = depth_stack[-1][1] if depth_stack else ""
+                        key = f"{parent_prompt}::{own}" if parent_prompt else own
                 else:
-                    # Duplicate or unknown prompt: fall back to depth stack.
-                    # For duplicates the user needs to keep the parent in
-                    # the file to give context; otherwise ambiguous.
+                    # Unknown prompt: depth-stack fallback
                     parent_prompt = depth_stack[-1][1] if depth_stack else ""
                     key = f"{parent_prompt}::{own}" if parent_prompt else own
 
@@ -1392,23 +1415,34 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
     # Which node ids are explicitly in the suppressed file?
     sup_node_ids: set[int] = {id(node) for node, *_ in ordered}
 
+    def _nearest_absent_ancestor(n: KNode) -> Optional[KNode]:
+        """Walk up until we find the first ancestor that is NOT in the
+        suppressed file (not in sup_node_ids) and is not the root.
+        Two nodes with the same nearest absent ancestor are in the same
+        logical group and should not be separated by a blank."""
+        p = n.parent
+        while p and p is not root:
+            if id(p) not in sup_node_ids:
+                return p
+            p = p.parent
+        return None  # parent chain is all-present or at root
+
     with path.open("w") as f:
-        first       = True
-        prev_parent: Optional[KNode] = None
+        first                    = True
+        prev_absent_ancestor: Optional[KNode] = None
         for node, entry, prefix, connector in ordered:
             is_struct = node.kind in ("menu", "choice", "if", "comment")
 
-            # Blank when the direct parent is NOT in the suppressed file AND
-            # the parent has changed since the previous entry — so siblings
-            # under the same absent parent are kept adjacent.
-            parent = node.parent
-            parent_absent = (parent is None
-                             or (parent is not root
-                                 and id(parent) not in sup_node_ids))
-            if not first and parent_absent and parent is not prev_parent:
+            # Blank when consecutive entries have DIFFERENT nearest absent
+            # ancestors — meaning they belong to different logical groups.
+            # Entries that share the same absent ancestor (e.g. siblings
+            # of a suppressed choice, or children of a choice that is
+            # itself inside an absent menu) stay adjacent.
+            absent_anc = _nearest_absent_ancestor(node)
+            if not first and absent_anc is not None and absent_anc is not prev_absent_ancestor:
                 f.write("\n")
             first = False
-            prev_parent = parent
+            prev_absent_ancestor = absent_anc
 
             # Pre-group comments
             if entry.pre_group:
