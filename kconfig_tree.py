@@ -726,16 +726,29 @@ class DocFileParser:
                     key = _struct_node_key(matching[0])
                 elif len(matching) > 1:
                     # Duplicate prompt: use the nearest preceding CONFIG_
-                    # symbol (tracked so far, not scanned from the end)
-                    # to find which candidate shares the same Kconfig parent.
+                    # symbol to find which candidate's parent subtree
+                    # contains that symbol.  This covers:
+                    #   - true siblings (ref.parent == m.parent)
+                    #   - ref inside a sub-if of m.parent (e.g. ref inside
+                    #     [if I2C] which is a child of m.parent)
+                    #   - ref is a direct child of m (m is structural)
                     resolved = None
                     if last_known_sym:
                         ref = self.knode_index.get(last_known_sym)
                         if ref:
+                            def _is_in_subtree(ancestor: KNode,
+                                               node: KNode) -> bool:
+                                """True if ancestor is node or an ancestor of node."""
+                                p = node
+                                while p:
+                                    if p is ancestor:
+                                        return True
+                                    p = p.parent
+                                return False
                             sibling_matches = [
                                 m for m in matching
-                                if m.parent is ref.parent   # true sibling
-                                or m.parent is ref          # ref is child of m
+                                if (m.parent is not None
+                                    and _is_in_subtree(m.parent, ref))
                             ]
                             if len(sibling_matches) == 1:
                                 resolved = sibling_matches[0]
