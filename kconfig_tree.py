@@ -699,7 +699,8 @@ class DocFileParser:
         # disambiguate identically-named nodes in different menus.
         # We reconstruct the parent from a depth stack of (depth, own_prompt).
 
-        depth_stack: list[tuple[int, str]] = []
+        depth_stack:    list[tuple[int, str]] = []
+        last_known_sym: str = ""  # nearest preceding CONFIG_ seen so far
 
         for entry in option_entries:
             if entry.symbol:
@@ -710,6 +711,7 @@ class DocFileParser:
                     self.warnings.append(
                         f"Duplicate symbol {entry.symbol} in "
                         f"{self.path.name} — keeping first")
+                last_known_sym = entry.symbol  # track as we go
             elif entry.comment_text:
                 own = entry.comment_text
                 d   = entry.depth
@@ -719,35 +721,36 @@ class DocFileParser:
 
                 matching = self.struct_knode_index.get(own, [])
                 if len(matching) == 1:
-                    # Unambiguous: Kconfig tree gives us the correct key
-                    # even when parent node is absent from the file.
+                    # Unambiguous: use Kconfig tree directly — works even
+                    # when parent node is absent from the file.
                     key = _struct_node_key(matching[0])
                 elif len(matching) > 1:
-                    # Duplicate prompt: try sibling-symbol disambiguation.
-                    # Find the nearest preceding CONFIG_ symbol in the file
-                    # and check which matching KNode has it as a sibling
-                    # (same Kconfig parent). This handles the common case
-                    # where a choice/menu follows a config in the same menu.
-                    last_sym = next(
-                        (e.symbol for e in reversed(option_entries)
-                         if e.symbol), "")
+                    # Duplicate prompt: use the nearest preceding CONFIG_
+                    # symbol (tracked so far, not scanned from the end)
+                    # to find which candidate shares the same Kconfig parent.
                     resolved = None
-                    if last_sym:
-                        ref_knode = self.knode_index.get(last_sym)
-                        if ref_knode:
+                    if last_known_sym:
+                        ref = self.knode_index.get(last_known_sym)
+                        if ref:
                             sibling_matches = [
                                 m for m in matching
-                                if m.parent is ref_knode.parent
-                                or m.parent is ref_knode
+                                if m.parent is ref.parent   # true sibling
+                                or m.parent is ref          # ref is child of m
                             ]
                             if len(sibling_matches) == 1:
                                 resolved = sibling_matches[0]
-                    if resolved:
-                        key = _struct_node_key(resolved)
-                    else:
-                        # Still ambiguous: depth-stack fallback
+                    if resolved is None:
+                        # Sibling lookup failed: try depth-stack parent prompt
                         parent_prompt = depth_stack[-1][1] if depth_stack else ""
-                        key = f"{parent_prompt}::{own}" if parent_prompt else own
+                        cand_key = f"{parent_prompt}::{own}" if parent_prompt else own
+                        # Accept if it matches exactly one candidate
+                        cand_matches = [m for m in matching
+                                        if _struct_node_key(m) == cand_key]
+                        if len(cand_matches) == 1:
+                            resolved = cand_matches[0]
+                    key = (_struct_node_key(resolved) if resolved
+                           else (f"{depth_stack[-1][1]}::{own}"
+                                 if depth_stack else own))
                 else:
                     # Unknown prompt: depth-stack fallback
                     parent_prompt = depth_stack[-1][1] if depth_stack else ""
