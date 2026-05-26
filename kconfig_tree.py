@@ -410,7 +410,12 @@ def build_struct_knode_index(
     """
     if idx is None:
         idx = {}
-    if (node.kind in ("menu", "choice", "if", "comment")
+    # 'if' nodes are intentionally excluded: their visibility is derived
+    # entirely from their children (which are unique CONFIG_ symbols), so
+    # they are emitted automatically by write_suppressed rather than being
+    # independently tracked.  This avoids intractable disambiguation of
+    # identical 'if EXPR' prompts across hundreds of Kconfig files.
+    if (node.kind in ("menu", "choice", "comment")
             and node.prompt and node.parent is not None):
         idx.setdefault(node.prompt.strip(), []).append(node)
     for c in node.children:
@@ -753,6 +758,12 @@ class DocFileParser:
             # Pop entries at same or deeper depth
             while depth_stack and depth_stack[-1][0] >= d:
                 depth_stack.pop()
+
+            # 'if' nodes are not indexed — they are auto-derived from
+            # their children in write_suppressed.  Skip them here.
+            if own.startswith("if "):
+                depth_stack.append((d, own))
+                continue
 
             matching = self.struct_knode_index.get(own, [])
             if len(matching) == 1:
@@ -1131,6 +1142,8 @@ class Merger:
     def _is_struct_suppressed(self, node: KNode) -> bool:
         if self.full:
             return False
+        if node.kind == "if":
+            return False  # 'if' visibility is derived from children only
         return _struct_node_key(node) in self.sup.struct_index
 
 
@@ -1180,6 +1193,8 @@ class Merger:
     def _is_struct_in_doc(self, node: KNode) -> bool:
         """True if this structural node is explicitly in the effective doc.
         Such nodes are always kept even if all their children are suppressed."""
+        if node.kind == "if":
+            return False  # 'if' visibility is derived from children only
         return _struct_node_key(node) in self._eff_struct
 
     def _has_visible_children(self, node: KNode) -> bool:
@@ -1399,6 +1414,17 @@ def write_doc(path: Path, lines: list[OutputLine]):
                 last_blank = False
 
 
+def _if_subtree_has_suppressed(node: KNode,
+                               symbol_index: dict) -> bool:
+    """Return True if any config/menuconfig in node's subtree is
+    present in symbol_index (i.e. is suppressed)."""
+    sym = node.symbol()
+    if sym and sym in symbol_index:
+        return True
+    return any(_if_subtree_has_suppressed(c, symbol_index)
+               for c in node.children)
+
+
 def _walk_suppressed(
     node:       KNode,
     sup:        "DocFileParser",
@@ -1426,10 +1452,17 @@ def _walk_suppressed(
     if node.kind in ("config", "menuconfig") and sym in sup.symbol_index:
         entry  = sup.symbol_index[sym]
         in_sup = True
-    elif node.kind in ("menu", "choice", "if", "comment"):
+    elif node.kind in ("menu", "choice", "comment"):
         nkey = _struct_node_key(node)
         if nkey in sup.struct_index:
             entry  = sup.struct_index[nkey]
+            in_sup = True
+    elif node.kind == "if":
+        # 'if' nodes are emitted automatically whenever their subtree
+        # contains suppressed symbols — no struct_index entry needed.
+        if _if_subtree_has_suppressed(node, sup.symbol_index):
+            # Synthetic entry: no stored RawEntry, no trailing comment
+            entry  = None
             in_sup = True
 
     if in_sup:
@@ -1493,15 +1526,16 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
             first = False
             prev_absent_ancestor = absent_anc
 
-            # Pre-group comments
-            if entry.pre_group:
+            # Pre-group comments (entry may be None for synthetic if-nodes)
+            if entry and entry.pre_group:
                 if entry.pre_group.blank_above:
                     f.write("\n")
                 for line in entry.pre_group.lines:
                     f.write(line + "\n")
 
             # Node line — same format as doc, at correct depth
-            tc = f" {entry.trailing_comment}" if entry.trailing_comment else ""
+            tc = (f" {entry.trailing_comment}"
+                  if entry and entry.trailing_comment else "")
             if node.symbol():
                 glyph  = node.raw_glyph()
                 prompt = node.prompt or node.name
@@ -1511,7 +1545,7 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
                 f.write(f"{prefix}{connector}{body}{tc}\n")
 
             # Post-group comments
-            for pg in entry.post_groups:
+            for pg in (entry.post_groups if entry else []):
                 if pg.blank_above:
                     f.write("\n")
                 for line in pg.lines:
