@@ -694,86 +694,91 @@ class DocFileParser:
                     option_entries[-1].post_groups.append(group)
                 # else: discard
 
-        # ── Pass 3: index ─────────────────────────────────────────────────────
-        # Structural entries use two-level key 'parent_prompt::own_prompt' to
-        # disambiguate identically-named nodes in different menus.
-        # We reconstruct the parent from a depth stack of (depth, own_prompt).
+        # ── Pass 3a: index all CONFIG_ symbols first ─────────────────────────
+        # We do symbols before structural nodes so that during structural
+        # disambiguation (Pass 3b) we can check which candidate's subtree
+        # contains the symbols that appear in this file.  This is much more
+        # reliable than using only the nearest preceding symbol, because a
+        # structural node's children in the file are the definitive proof of
+        # which Kconfig subtree it belongs to.
 
-        depth_stack:    list[tuple[int, str]] = []
-        last_known_sym: str = ""  # nearest preceding CONFIG_ seen so far
+        for entry in option_entries:
+            if not entry.symbol:
+                continue
+            if entry.symbol not in self.symbol_index:
+                self.symbol_index[entry.symbol] = entry
+                self.ordered.append(entry)
+            else:
+                self.warnings.append(
+                    f"Duplicate symbol {entry.symbol} in "
+                    f"{self.path.name} — keeping first")
+
+        # ── Pass 3b: index structural entries ─────────────────────────────────
+        # Now that symbol_index is complete, disambiguate duplicate structural
+        # prompts by finding which candidate's subtree contains the most
+        # (or any) symbols already present in symbol_index.
+
+        def _desc_in_index(node: KNode) -> set[str]:
+            """Return symbols in self.symbol_index that are descendants of node."""
+            result: set[str] = set()
+            for child in node.children:
+                sym = child.symbol()
+                if sym and sym in self.symbol_index:
+                    result.add(sym)
+                result.update(_desc_in_index(child))
+            return result
+
+        depth_stack: list[tuple[int, str]] = []
 
         for entry in option_entries:
             if entry.symbol:
-                if entry.symbol not in self.symbol_index:
-                    self.symbol_index[entry.symbol] = entry
-                    self.ordered.append(entry)
-                else:
-                    self.warnings.append(
-                        f"Duplicate symbol {entry.symbol} in "
-                        f"{self.path.name} — keeping first")
-                last_known_sym = entry.symbol  # track as we go
-            elif entry.comment_text:
-                own = entry.comment_text
-                d   = entry.depth
-                # Pop entries at same or deeper depth
-                while depth_stack and depth_stack[-1][0] >= d:
-                    depth_stack.pop()
+                # Already indexed in Pass 3a; just update depth stack tracking
+                # (structural nodes use depth_stack, not symbols, but we still
+                #  need to process symbol entries to keep ordering correct).
+                continue
+            if not entry.comment_text:
+                continue
 
-                matching = self.struct_knode_index.get(own, [])
-                if len(matching) == 1:
-                    # Unambiguous: use Kconfig tree directly — works even
-                    # when parent node is absent from the file.
-                    key = _struct_node_key(matching[0])
-                elif len(matching) > 1:
-                    # Duplicate prompt: use the nearest preceding CONFIG_
-                    # symbol to find which candidate's parent subtree
-                    # contains that symbol.  This covers:
-                    #   - true siblings (ref.parent == m.parent)
-                    #   - ref inside a sub-if of m.parent (e.g. ref inside
-                    #     [if I2C] which is a child of m.parent)
-                    #   - ref is a direct child of m (m is structural)
-                    resolved = None
-                    if last_known_sym:
-                        ref = self.knode_index.get(last_known_sym)
-                        if ref:
-                            def _is_in_subtree(ancestor: KNode,
-                                               node: KNode) -> bool:
-                                """True if ancestor is node or an ancestor of node."""
-                                p = node
-                                while p:
-                                    if p is ancestor:
-                                        return True
-                                    p = p.parent
-                                return False
-                            sibling_matches = [
-                                m for m in matching
-                                if (m.parent is not None
-                                    and _is_in_subtree(m.parent, ref))
-                            ]
-                            if len(sibling_matches) == 1:
-                                resolved = sibling_matches[0]
-                    if resolved is None:
-                        # Sibling lookup failed: try depth-stack parent prompt
-                        parent_prompt = depth_stack[-1][1] if depth_stack else ""
-                        cand_key = f"{parent_prompt}::{own}" if parent_prompt else own
-                        # Accept if it matches exactly one candidate
-                        cand_matches = [m for m in matching
-                                        if _struct_node_key(m) == cand_key]
-                        if len(cand_matches) == 1:
-                            resolved = cand_matches[0]
-                    key = (_struct_node_key(resolved) if resolved
-                           else (f"{depth_stack[-1][1]}::{own}"
-                                 if depth_stack else own))
+            own = entry.comment_text
+            d   = entry.depth
+            # Pop entries at same or deeper depth
+            while depth_stack and depth_stack[-1][0] >= d:
+                depth_stack.pop()
+
+            matching = self.struct_knode_index.get(own, [])
+            if len(matching) == 1:
+                # Unambiguous: use Kconfig tree directly.
+                key = _struct_node_key(matching[0])
+            elif len(matching) > 1:
+                # Multiple candidates with the same prompt.
+                # Primary: find the candidate whose subtree contains the
+                # most symbols from this file (children prove membership).
+                scored = [(len(_desc_in_index(m)), m) for m in matching]
+                scored.sort(key=lambda x: x[0], reverse=True)
+                if scored[0][0] > 0 and (
+                        len(scored) < 2 or scored[0][0] > scored[1][0]):
+                    # Unique best match by descendant count
+                    key = _struct_node_key(scored[0][1])
                 else:
-                    # Unknown prompt: depth-stack fallback
+                    # Fallback: depth-stack parent prompt
                     parent_prompt = depth_stack[-1][1] if depth_stack else ""
-                    key = f"{parent_prompt}::{own}" if parent_prompt else own
+                    cand_key = f"{parent_prompt}::{own}" if parent_prompt else own
+                    cand_matches = [m for m in matching
+                                    if _struct_node_key(m) == cand_key]
+                    if len(cand_matches) == 1:
+                        key = _struct_node_key(cand_matches[0])
+                    else:
+                        key = cand_key  # best effort
+            else:
+                # Unknown prompt: depth-stack fallback
+                parent_prompt = depth_stack[-1][1] if depth_stack else ""
+                key = f"{parent_prompt}::{own}" if parent_prompt else own
 
-                entry.comment_text = key  # upgrade to two-level key in-place
-                if key not in self.struct_index:
-                    self.struct_index[key] = entry
-                    self.ordered.append(entry)
-                depth_stack.append((d, own))
+            entry.comment_text = key  # upgrade to two-level key in-place
+            if key not in self.struct_index:
+                self.struct_index[key] = entry
+                self.ordered.append(entry)
+            depth_stack.append((d, own))
 
         # ── Pass 4: validate against Kconfig tree ─────────────────────────────
         # Unknown symbols:
