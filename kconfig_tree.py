@@ -728,13 +728,22 @@ class DocFileParser:
                 result.update(_desc_in_index(child))
             return result
 
-        depth_stack: list[tuple[int, str]] = []
+        def _is_in_subtree(ancestor: KNode, node: KNode) -> bool:
+            """True if ancestor is node or any ancestor of node."""
+            p = node
+            while p:
+                if p is ancestor:
+                    return True
+                p = p.parent
+            return False
+
+        depth_stack:    list[tuple[int, str]] = []
+        last_known_sym: str = ""  # nearest preceding CONFIG_ in file order
 
         for entry in option_entries:
             if entry.symbol:
-                # Already indexed in Pass 3a; just update depth stack tracking
-                # (structural nodes use depth_stack, not symbols, but we still
-                #  need to process symbol entries to keep ordering correct).
+                # Track last seen symbol for sibling-disambiguation fallback.
+                last_known_sym = entry.symbol
                 continue
             if not entry.comment_text:
                 continue
@@ -751,24 +760,43 @@ class DocFileParser:
                 key = _struct_node_key(matching[0])
             elif len(matching) > 1:
                 # Multiple candidates with the same prompt.
-                # Primary: find the candidate whose subtree contains the
-                # most symbols from this file (children prove membership).
+                # Strategy 1: descendant count — the candidate whose subtree
+                # contains the most indexed symbols wins.  Works when the
+                # structural node's children are present in the file.
                 scored = [(len(_desc_in_index(m)), m) for m in matching]
                 scored.sort(key=lambda x: x[0], reverse=True)
+                resolved = None
                 if scored[0][0] > 0 and (
                         len(scored) < 2 or scored[0][0] > scored[1][0]):
-                    # Unique best match by descendant count
-                    key = _struct_node_key(scored[0][1])
-                else:
-                    # Fallback: depth-stack parent prompt
+                    resolved = scored[0][1]
+
+                # Strategy 2: sibling/ancestor check using the nearest
+                # preceding CONFIG_ symbol.  Works when children are absent
+                # from the file (e.g. a childless [if GREYBUS]) but a sibling
+                # config (e.g. GREYBUS itself) precedes it.
+                if resolved is None and last_known_sym:
+                    ref = self.knode_index.get(last_known_sym)
+                    if ref:
+                        sib = [
+                            m for m in matching
+                            if m.parent is not None
+                            and _is_in_subtree(m.parent, ref)
+                        ]
+                        if len(sib) == 1:
+                            resolved = sib[0]
+
+                # Strategy 3: depth-stack parent prompt
+                if resolved is None:
                     parent_prompt = depth_stack[-1][1] if depth_stack else ""
                     cand_key = f"{parent_prompt}::{own}" if parent_prompt else own
                     cand_matches = [m for m in matching
                                     if _struct_node_key(m) == cand_key]
                     if len(cand_matches) == 1:
-                        key = _struct_node_key(cand_matches[0])
-                    else:
-                        key = cand_key  # best effort
+                        resolved = cand_matches[0]
+
+                key = (_struct_node_key(resolved) if resolved
+                       else (f"{depth_stack[-1][1]}::{own}"
+                             if depth_stack else own))
             else:
                 # Unknown prompt: depth-stack fallback
                 parent_prompt = depth_stack[-1][1] if depth_stack else ""
