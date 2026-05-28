@@ -135,6 +135,8 @@ class KNode:
     file: str = ""
     lineno: int = 0
     value: Optional[str] = None
+    occurrence_key:  str = ""
+    first_child_sym: str = ""
 
     def symbol(self) -> str:
         return f"CONFIG_{self.name}" if self.name else ""
@@ -399,6 +401,47 @@ def build_knode_index(node: KNode,
     return idx
 
 
+def _first_config_sym(node: KNode) -> str:
+    for child in node.children:
+        if child.kind in ("config", "menuconfig") and child.name:
+            return child.symbol()
+        sym = _first_config_sym(child)
+        if sym: return sym
+    return ""
+
+
+def assign_if_keys(root: KNode) -> dict[str, int]:
+    """Assign occurrence_key to every 'if' node. Returns {expr: count}.
+    First occurrence: 'if EXPR'; Nth (N>=2): 'if EXPR (N)'.
+    """
+    counts: dict[str, int] = {}
+    def _walk(node: KNode):
+        if node.kind == "if" and node.prompt:
+            expr = node.prompt.strip()
+            n = counts.get(expr, 0) + 1
+            counts[expr] = n
+            node.occurrence_key  = f"__if__{expr}__#{n}"
+            node.first_child_sym = _first_config_sym(node)
+        for child in node.children: _walk(child)
+    _walk(root)
+    def _finalise(node: KNode):
+        if node.kind == "if" and node.occurrence_key.startswith("__if__"):
+            parts = node.occurrence_key[len("__if__"):].rsplit("__#", 1)
+            expr, n = parts[0], int(parts[1])
+            node.occurrence_key = expr if n == 1 else f"{expr} ({n})"
+        for child in node.children: _finalise(child)
+    _finalise(root)
+    return counts
+
+
+_IF_OCC_RE = re.compile(r"^(if .+) \((\d+)\)$")
+
+
+def _parse_if_occurrence(key: str) -> tuple[str, int]:
+    m = _IF_OCC_RE.match(key)
+    return (m.group(1), int(m.group(2))) if m else (key, 1)
+
+
 def build_struct_knode_index(
         node: KNode,
         idx:  Optional[dict] = None) -> dict[str, list[KNode]]:
@@ -410,14 +453,11 @@ def build_struct_knode_index(
     """
     if idx is None:
         idx = {}
-    # 'if' nodes are intentionally excluded: their visibility is derived
-    # entirely from their children (which are unique CONFIG_ symbols), so
-    # they are emitted automatically by write_suppressed rather than being
-    # independently tracked.  This avoids intractable disambiguation of
-    # identical 'if EXPR' prompts across hundreds of Kconfig files.
     if (node.kind in ("menu", "choice", "comment")
             and node.prompt and node.parent is not None):
         idx.setdefault(node.prompt.strip(), []).append(node)
+    elif node.kind == "if" and node.occurrence_key and node.parent is not None:
+        idx.setdefault(node.occurrence_key, []).append(node)
     for c in node.children:
         build_struct_knode_index(c, idx)
     return idx
@@ -516,10 +556,8 @@ def _struct_prompt_key(content_clean: str) -> str:
 
 
 def _struct_node_key(node: KNode) -> str:
-    """Two-level key: 'nearest_structural_parent_prompt::own_prompt'.
-    If no structural parent exists above root, returns just own_prompt.
-    This disambiguates same-named nodes in different menus.
-    """
+    if node.kind == "if":
+        return node.occurrence_key
     own = node.prompt.strip() if node.prompt else ""
     p = node.parent
     while p:
@@ -551,6 +589,7 @@ class DocFileParser:
         self.struct_index: dict[str, RawEntry] = {}
         self.ordered: list[RawEntry] = []
         self.dead_entries: list[RawEntry] = []  # unknown symbols, kept as comments
+        self.max_if_occurrences: dict[str, int] = {}
         self.warnings: list[str] = []
         self._parse()
 
@@ -759,12 +798,6 @@ class DocFileParser:
             while depth_stack and depth_stack[-1][0] >= d:
                 depth_stack.pop()
 
-            # 'if' nodes are not indexed — they are auto-derived from
-            # their children in write_suppressed.  Skip them here.
-            if own.startswith("if "):
-                depth_stack.append((d, own))
-                continue
-
             matching = self.struct_knode_index.get(own, [])
             if len(matching) == 1:
                 # Unambiguous: use Kconfig tree directly.
@@ -817,6 +850,11 @@ class DocFileParser:
             if key not in self.struct_index:
                 self.struct_index[key] = entry
                 self.ordered.append(entry)
+            # Track highest occurrence number seen for change detection
+            if key.startswith("if "):
+                base_expr, n = _parse_if_occurrence(key)
+                self.max_if_occurrences[base_expr] = max(
+                    self.max_if_occurrences.get(base_expr, 0), n)
             depth_stack.append((d, own))
 
         # ── Pass 4: validate against Kconfig tree ─────────────────────────────
@@ -948,7 +986,7 @@ def _plain_body(node: KNode) -> str:
     if node.kind == "comment":
         return f"--- {node.prompt} ---"
     if node.kind == "if":
-        return f"[{node.prompt}]"
+        return f"[{node.occurrence_key or node.prompt}]"
     prompt = node.prompt or node.name
     tag    = f" ({node.name})" if node.name else ""
     return f"{glyph} {prompt}{tag}" if glyph else f"{prompt}{tag}"
@@ -964,7 +1002,7 @@ def _colour_body(node: KNode) -> str:
     if node.kind == "comment":
         return gray(f"--- {node.prompt} ---")
     if node.kind == "if":
-        return gray(f"[{node.prompt}]")
+        return gray(f"[{node.occurrence_key or node.prompt}]")
     prompt = node.prompt or node.name
     pstr   = bold(prompt) if node.is_active() else gray(prompt)
     tag    = gray(f" ({node.name})") if node.name else ""
@@ -1142,8 +1180,6 @@ class Merger:
     def _is_struct_suppressed(self, node: KNode) -> bool:
         if self.full:
             return False
-        if node.kind == "if":
-            return False  # 'if' visibility is derived from children only
         return _struct_node_key(node) in self.sup.struct_index
 
 
@@ -1193,8 +1229,6 @@ class Merger:
     def _is_struct_in_doc(self, node: KNode) -> bool:
         """True if this structural node is explicitly in the effective doc.
         Such nodes are always kept even if all their children are suppressed."""
-        if node.kind == "if":
-            return False  # 'if' visibility is derived from children only
         return _struct_node_key(node) in self._eff_struct
 
     def _has_visible_children(self, node: KNode) -> bool:
@@ -1414,17 +1448,6 @@ def write_doc(path: Path, lines: list[OutputLine]):
                 last_blank = False
 
 
-def _if_subtree_has_suppressed(node: KNode,
-                               symbol_index: dict) -> bool:
-    """Return True if any config/menuconfig in node's subtree is
-    present in symbol_index (i.e. is suppressed)."""
-    sym = node.symbol()
-    if sym and sym in symbol_index:
-        return True
-    return any(_if_subtree_has_suppressed(c, symbol_index)
-               for c in node.children)
-
-
 def _walk_suppressed(
     node:       KNode,
     sup:        "DocFileParser",
@@ -1452,17 +1475,10 @@ def _walk_suppressed(
     if node.kind in ("config", "menuconfig") and sym in sup.symbol_index:
         entry  = sup.symbol_index[sym]
         in_sup = True
-    elif node.kind in ("menu", "choice", "comment"):
+    elif node.kind in ("menu", "choice", "if", "comment"):
         nkey = _struct_node_key(node)
         if nkey in sup.struct_index:
             entry  = sup.struct_index[nkey]
-            in_sup = True
-    elif node.kind == "if":
-        # 'if' nodes are emitted automatically whenever their subtree
-        # contains suppressed symbols — no struct_index entry needed.
-        if _if_subtree_has_suppressed(node, sup.symbol_index):
-            # Synthetic entry: no stored RawEntry, no trailing comment
-            entry  = None
             in_sup = True
 
     if in_sup:
@@ -1534,8 +1550,7 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
                     f.write(line + "\n")
 
             # Node line — same format as doc, at correct depth
-            tc = (f" {entry.trailing_comment}"
-                  if entry and entry.trailing_comment else "")
+            tc = f" {entry.trailing_comment}" if (entry and entry.trailing_comment) else ""
             if node.symbol():
                 glyph  = node.raw_glyph()
                 prompt = node.prompt or node.name
@@ -1650,6 +1665,22 @@ def main():
     if sup_path.exists():
         print(f"Reading {sup_path} …", file=sys.stderr)
     sup = DocFileParser(sup_path, knode_index, struct_knode_index)
+
+    combined_max: dict[str, int] = {}
+    for expr, n in {**doc.max_if_occurrences, **sup.max_if_occurrences}.items():
+        combined_max[expr] = max(combined_max.get(expr,0),
+                                doc.max_if_occurrences.get(expr,0),
+                                sup.max_if_occurrences.get(expr,0))
+    for expr, seen_max in combined_max.items():
+        tree_n = if_occurrence_counts.get(expr, 0)
+        if seen_max > tree_n:
+            print(f"WARNING: [{expr} ({seen_max})] referenced but tree has "
+                  f"only {tree_n} occurrence(s) — may have shifted",
+                  file=sys.stderr)
+        elif tree_n > seen_max > 0:
+            print(f"NOTICE: [{expr}] has {tree_n} occurrences in tree, "
+                  f"doc+suppressed only reference up to ({seen_max})",
+                  file=sys.stderr)
 
     merger = Merger(
         root        = root,
