@@ -850,8 +850,10 @@ class DocFileParser:
             if key not in self.struct_index:
                 self.struct_index[key] = entry
                 self.ordered.append(entry)
-            # Track highest occurrence number seen for change detection
-            if key.startswith("if "):
+            # Track highest occurrence number seen for change detection.
+            # Only for genuine 'if' node keys — exclude two-level keys such as
+            # "if EXPR::Child prompt" where the parent happens to be an if-block.
+            if key.startswith("if ") and "::" not in key:
                 base_expr, n = _parse_if_occurrence(key)
                 self.max_if_occurrences[base_expr] = max(
                     self.max_if_occurrences.get(base_expr, 0), n)
