@@ -1656,6 +1656,8 @@ def main():
     annotate_tree(root, cfg)
     knode_index = build_knode_index(root)
 
+    if_occurrence_counts = assign_if_keys(root)
+
     struct_knode_index = build_struct_knode_index(root)
 
     if doc_path.exists():
