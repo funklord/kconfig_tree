@@ -135,39 +135,74 @@ class KNode:
     file: str = ""
     lineno: int = 0
     value: Optional[str] = None
+    alt_values: list = field(default_factory=list)
     occurrence_key:  str = ""
     first_child_sym: str = ""
 
     def symbol(self) -> str:
         return f"CONFIG_{self.name}" if self.name else ""
 
-    def is_active(self) -> bool:
-        if self.value is None:
-            return False
-        v = self.value.strip().strip('"')
-        return v not in ("", "n", "0")
+    def is_active(self, col: int = 0) -> bool:
+        v = self._col_value(col)
+        if v is None: return False
+        return v.strip().strip('"') not in ("", "n", "0")
 
-    def raw_glyph(self) -> str:
+    def _col_value(self, col: int) -> Optional[str]:
+        if col == 0: return self.value
+        idx = col - 1
+        return self.alt_values[idx] if idx < len(self.alt_values) else None
+
+    def any_col_active(self) -> bool:
+        return any(self.is_active(c)
+                   for c in range(1 + len(self.alt_values)))
+
+    def _val_char(self, col: int) -> str:
+        v = self._col_value(col)
+        if v is None: return " "
+        v = v.strip().strip('"')
+        if v == "y": return "*"
+        if v == "m": return "m"
+        return " "
+
+    def raw_glyph(self, num_cols: int = 1) -> str:
         if self.kind in ("menu", "choice", "comment", "if"):
             return ""
-        if self.value is None:
-            return "[ ]"
-        v = self.value.strip().strip('"')
-        if v == "y":        return "[*]"
-        if v == "m":        return "[M]"
-        if v in ("n", ""):  return "[ ]"
-        return f"[={v}]"
+        if num_cols == 1:
+            if self.value is None: return "[ ]"
+            v = self.value.strip().strip('"')
+            if v == "y":       return "[*]"
+            if v == "m":       return "[M]"
+            if v in ("n",""): return "[ ]"
+            return f"[={v}]"
+        # Multi-col: check for value-type (int/hex/string)
+        vstr = [((self._col_value(c) or "").strip().strip('"'))
+                for c in range(num_cols)]
+        non_bool = any(s not in ('y','m','n','') for s in vstr)
+        if non_bool:
+            unique = list(dict.fromkeys(s for s in vstr if s and s not in ('n','')))
+            return f"[={'/' .join(unique)}]" if unique else "[ ]"
+        return "[" + "".join(self._val_char(c) for c in range(num_cols)) + "]"
 
-    def coloured_glyph(self) -> str:
+    def coloured_glyph(self, num_cols: int = 1) -> str:
         if self.kind in ("menu", "choice", "comment", "if"):
             return ""
-        if self.value is None:
-            return gray("[ ]")
-        v = self.value.strip().strip('"')
-        if v == "y":        return green("[*]")
-        if v == "m":        return yellow("[M]")
-        if v in ("n", ""):  return gray("[ ]")
-        return cyan(f"[={v}]")
+        if num_cols == 1:
+            if self.value is None: return gray("[ ]")
+            v = self.value.strip().strip('"')
+            if v == "y":       return green("[*]")
+            if v == "m":       return yellow("[M]")
+            if v in ("n",""): return gray("[ ]")
+            return cyan(f"[={v}]")
+        vstr = [((self._col_value(c) or "").strip().strip('"'))
+                for c in range(num_cols)]
+        non_bool = any(s not in ('y','m','n','') for s in vstr)
+        if non_bool:
+            unique = list(dict.fromkeys(s for s in vstr if s and s not in ('n','')))
+            return cyan(f"[={'/' .join(unique)}]") if unique else gray("[ ]")
+        def cc(c):
+            ch = self._val_char(c)
+            return green("*") if ch=="*" else yellow("m") if ch=="m" else gray(" ")
+        return "[" + "".join(cc(c) for c in range(num_cols)) + "]"
 
     def ancestry(self) -> list["KNode"]:
         chain: list["KNode"] = []
@@ -382,11 +417,17 @@ def load_dotconfig(path: Path) -> dict[str, str]:
     return cfg
 
 
-def annotate_tree(node: KNode, cfg: dict[str, str]):
+def annotate_tree(node: KNode, cfg: dict[str, str], col: int = 0):
     if node.name:
-        node.value = cfg.get(node.symbol())
+        v = cfg.get(node.symbol())
+        if col == 0:
+            node.value = v
+        else:
+            while len(node.alt_values) < col:
+                node.alt_values.append(None)
+            node.alt_values[col - 1] = v
     for c in node.children:
-        annotate_tree(c, cfg)
+        annotate_tree(c, cfg, col)
 
 
 def build_knode_index(node: KNode,
@@ -979,8 +1020,8 @@ def _emit_comment_group(push_fn, push_blank_fn,
 
 # ── Line renderers ─────────────────────────────────────────────────────────────
 
-def _plain_body(node: KNode) -> str:
-    glyph = node.raw_glyph()
+def _plain_body(node: KNode, num_cols: int = 1) -> str:
+    glyph = node.raw_glyph(num_cols)
     if node.kind == "menu":
         return f"▶ {node.prompt}" if node.prompt else "▶ (menu)"
     if node.kind == "choice":
@@ -994,8 +1035,8 @@ def _plain_body(node: KNode) -> str:
     return f"{glyph} {prompt}{tag}" if glyph else f"{prompt}{tag}"
 
 
-def _colour_body(node: KNode) -> str:
-    glyph = node.coloured_glyph()
+def _colour_body(node: KNode, num_cols: int = 1) -> str:
+    glyph = node.coloured_glyph(num_cols)
     if node.kind == "menu":
         p = f"▶ {node.prompt}" if node.prompt else "▶ (menu)"
         return bold(cyan(p))
@@ -1006,21 +1047,21 @@ def _colour_body(node: KNode) -> str:
     if node.kind == "if":
         return gray(f"[{node.occurrence_key or node.prompt}]")
     prompt = node.prompt or node.name
-    pstr   = bold(prompt) if node.is_active() else gray(prompt)
+    pstr   = bold(prompt) if node.is_active(0) else gray(prompt)
     tag    = gray(f" ({node.name})") if node.name else ""
     return f"{glyph} {pstr}{tag}" if glyph else f"{pstr}{tag}"
 
 
 def _plain_line(node: KNode, prefix: str, connector: str,
-                trailing: str = "") -> str:
+                trailing: str = "", num_cols: int = 1) -> str:
     tc = f" {trailing}" if trailing else ""
-    return f"{prefix}{connector}{_plain_body(node)}{tc}"
+    return f"{prefix}{connector}{_plain_body(node, num_cols)}{tc}"
 
 
 def _colour_line(node: KNode, prefix: str, connector: str,
-                 trailing: str = "") -> str:
+                 trailing: str = "", num_cols: int = 1) -> str:
     tc = f" {gray(trailing)}" if trailing else ""
-    return f"{prefix}{connector}{_colour_body(node)}{tc}"
+    return f"{prefix}{connector}{_colour_body(node, num_cols)}{tc}"
 
 
 # ── OutputLine ─────────────────────────────────────────────────────────────────
@@ -1048,17 +1089,21 @@ class Merger:
         doc:          DocFileParser,
         sup:          DocFileParser,
         knode_index:  dict[str, KNode],
-        add_new:      bool = False,
-        add_new_en:   bool = False,
-        full:         bool = False,
+        add_new:        bool = False,
+        add_new_en:     bool = False,
+        add_new_en_col: int  = 0,
+        full:           bool = False,
+        num_cols:       int  = 1,
     ):
-        self.root        = root
-        self.doc         = doc
-        self.sup         = sup
-        self.knode_index = knode_index
-        self.add_new     = add_new
-        self.add_new_en  = add_new_en
-        self.full        = full
+        self.root          = root
+        self.doc           = doc
+        self.sup           = sup
+        self.knode_index   = knode_index
+        self.add_new       = add_new
+        self.add_new_en    = add_new_en
+        self.add_new_en_col = add_new_en_col
+        self.full          = full
+        self.num_cols      = num_cols
 
         self.output:   list[OutputLine] = []
         self.notices:  list[str] = []
@@ -1168,7 +1213,7 @@ class Merger:
             return False
         if self.add_new:
             return True
-        if self.add_new_en and node.is_active():
+        if self.add_new_en and node.is_active(self.add_new_en_col):
             return True
         return False
 
@@ -1256,7 +1301,7 @@ class Merger:
                     out.append(child)
                 else:
                     sym = child.symbol()
-                    if (child.is_active()
+                    if (child.any_col_active()
                             and not self._in_eff_doc(sym)
                             and not self._in_sup(sym)
                             and not self.add_new
@@ -1315,8 +1360,8 @@ class Merger:
                 self._emit_group(entry.pre_group, cmt_indent, is_pre=True)
 
             trailing = entry.trailing_comment if entry else ""
-            self._push(_plain_line(node, prefix, connector, trailing),
-                       _colour_line(node, prefix, connector, trailing))
+            self._push(_plain_line(node, prefix, connector, trailing, self.num_cols),
+                       _colour_line(node, prefix, connector, trailing, self.num_cols))
 
             # Type-2 or type-4 post-comment
             for g in (entry.post_groups if entry else []):
@@ -1367,8 +1412,8 @@ class Merger:
             self._emit_group(entry.pre_group, cmt_indent, is_pre=True)
 
         trailing = entry.trailing_comment if entry else ""
-        self._push(_plain_line(node, prefix, connector, trailing),
-                   _colour_line(node, prefix, connector, trailing),
+        self._push(_plain_line(node, prefix, connector, trailing, self.num_cols),
+                   _colour_line(node, prefix, connector, trailing, self.num_cols),
                    symbol=sym)
 
         # Type-2 or type-4 post-comment
@@ -1621,12 +1666,16 @@ def main():
         epilog=__doc__,
     )
     ap.add_argument("--kconfig",         default="Kconfig")
-    ap.add_argument("--dotconfig",       default=".config")
+    ap.add_argument("--dotconfig",        default=".config")
+    ap.add_argument("--dotconfig2",       default=".config2")
+    ap.add_argument("--dotconfig3",       default=".config3")
     ap.add_argument("--doc",             default=DEFAULT_DOC)
     ap.add_argument("--suppressed",      default=DEFAULT_SUP)
     ap.add_argument("--arch",            default="arm64")
     ap.add_argument("--add-new",         action="store_true")
-    ap.add_argument("--add-new-enabled", action="store_true")
+    ap.add_argument("--add-new-enabled", nargs="?", const="1", default=None,
+                    metavar="1-3",
+                    help="Add active symbols from column N (default 1)")
     ap.add_argument("--full",            action="store_true")
     ap.add_argument("--emit-kconfig",    action="store_true")
     ap.add_argument("--show",            action="store_true")
@@ -1641,9 +1690,19 @@ def main():
 
     kernel_root    = Path(".").resolve()
     kconfig_path   = Path(args.kconfig)
-    dotconfig_path = Path(args.dotconfig)
-    doc_path       = Path(args.doc)
-    sup_path       = Path(args.suppressed)
+    dotconfig_path  = Path(args.dotconfig)
+    dotconfig2_path = Path(args.dotconfig2)
+    dotconfig3_path = Path(args.dotconfig3)
+    doc_path        = Path(args.doc)
+    sup_path        = Path(args.suppressed)
+
+    add_new_en     = args.add_new_enabled is not None
+    add_new_en_col = 0
+    if add_new_en:
+        try:
+            add_new_en_col = max(0, int(args.add_new_enabled or "1") - 1)
+        except ValueError:
+            add_new_en_col = 0
 
     if not kconfig_path.exists():
         sys.exit(f"ERROR: Kconfig file not found: {kconfig_path}\n"
@@ -1655,7 +1714,18 @@ def main():
 
     print(f"Loading {dotconfig_path} …", file=sys.stderr)
     cfg = load_dotconfig(dotconfig_path)
-    annotate_tree(root, cfg)
+    annotate_tree(root, cfg, col=0)
+
+    num_cols = 1
+    if dotconfig2_path.exists():
+        print(f"Loading {dotconfig2_path} …", file=sys.stderr)
+        annotate_tree(root, load_dotconfig(dotconfig2_path), col=1)
+        num_cols = 2
+    if dotconfig3_path.exists():
+        print(f"Loading {dotconfig3_path} …", file=sys.stderr)
+        annotate_tree(root, load_dotconfig(dotconfig3_path), col=2)
+        num_cols = 3
+
     knode_index = build_knode_index(root)
 
     if_occurrence_counts = assign_if_keys(root)
@@ -1679,21 +1749,28 @@ def main():
         tree_n = if_occurrence_counts.get(expr, 0)
         if seen_max > tree_n:
             print(f"WARNING: [{expr} ({seen_max})] referenced but tree has "
-                  f"only {tree_n} occurrence(s) — may have shifted",
+                  f"only {tree_n} occurrence(s) — may have shifted after kernel update",
                   file=sys.stderr)
-        elif tree_n > seen_max > 0:
-            print(f"NOTICE: [{expr}] has {tree_n} occurrences in tree, "
-                  f"doc+suppressed only reference up to ({seen_max})",
+        elif tree_n > seen_max and seen_max > 1:
+            # Only notify when the user is already referencing numbered occurrences
+            # (seen_max > 1) so they know there are more.  When seen_max == 1 the
+            # user only references the unnumbered first occurrence — that's normal
+            # and not worth reporting for every common 'if' expression.
+            print(f"NOTICE: [{expr}] has {tree_n} occurrences in tree; "
+                  f"doc+suppressed reference up to [{expr} ({seen_max})] — "
+                  f"[{expr} ({tree_n})] also exists",
                   file=sys.stderr)
 
     merger = Merger(
-        root        = root,
-        doc         = doc,
-        sup         = sup,
-        knode_index = knode_index,
-        add_new     = args.add_new,
-        add_new_en  = args.add_new_enabled,
-        full        = args.full,
+        root           = root,
+        doc            = doc,
+        sup            = sup,
+        knode_index    = knode_index,
+        add_new        = args.add_new,
+        add_new_en     = add_new_en,
+        add_new_en_col = add_new_en_col,
+        full           = args.full,
+        num_cols       = num_cols,
     )
     output_lines = merger.run()
 
@@ -1748,11 +1825,12 @@ def main():
                if ol.symbol and not ol.is_notice and not ol.is_warning]
     active_tracked = sum(
         1 for ol in tracked
-        if knode_index.get(ol.symbol, KNode("", "")).is_active()
+        if knode_index.get(ol.symbol, KNode("", "")).any_col_active()
     )
     print(file=sys.stderr)
+    col_label = f" ({num_cols} configs)" if num_cols > 1 else ""
     print(
-        f"{bold('Kconfig')}: "
+        f"{bold('Kconfig')}{col_label}: "
         f"{green(str(stats['yes']))} built-in  "
         f"{yellow(str(stats['module']))} module  "
         f"{gray(str(stats['no']))} disabled  "
