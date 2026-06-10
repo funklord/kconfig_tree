@@ -433,8 +433,12 @@ class KconfigParser:
 
             m = _IF_RE.match(line)
             if m and not line.strip().startswith("default"):
+                # Strip inline Kconfig comment from expression
+                # e.g. "if !KMSAN # avoid false positives" -> "if !KMSAN"
+                import re as _re
+                _expr = _re.sub(r'\s*#.*$', '', m.group(1)).strip()
                 node = KNode(kind="if", name="",
-                             prompt=f"if {m.group(1).strip()}",
+                             prompt=f"if {_expr}",
                              file=str(path), lineno=i)
                 node.parent = cur()
                 cur().children.append(node)
@@ -948,6 +952,13 @@ class DocFileParser:
                         f"({self.path.name}:{entry.depth}) -- "
                         f"if-entries are display-only context; "
                         f"move the comment to the controlling config option")
+                # Still track max occurrence for change detection so
+                # auto-derived if-context in suppressed file does not
+                # trigger false NOTICE messages on every run.
+                if own.startswith("if ") and "::" not in own:
+                    _base, _n = _parse_if_occurrence(own)
+                    self.max_if_occurrences[_base] = max(
+                        self.max_if_occurrences.get(_base, 0), _n)
                 depth_stack.append((d, own))
                 continue
 
@@ -1698,12 +1709,18 @@ def _walk_suppressed(
     prefix:     str,
     parent_children: list,
     out:        list,
+    _emitted_syms: Optional[set] = None,
 ):
     """Walk Kconfig tree depth-first.
     For each node in sup.symbol_index or sup.struct_index, record
     (node, entry, prefix, connector) so write_suppressed can render it
     at the correct tree depth.  Parent nodes that are NOT in the suppressed
-    index are silently skipped but their depth is still accumulated."""
+    index are silently skipped but their depth is still accumulated.
+    _emitted_syms prevents duplicates when the same CONFIG_ symbol is
+    defined more than once in the Kconfig tree.
+    """
+    if _emitted_syms is None:
+        _emitted_syms = set()
     sym = node.symbol()
 
     # Determine connector for this node among its siblings
@@ -1716,9 +1733,11 @@ def _walk_suppressed(
 
     in_sup = False
     entry  = None
-    if node.kind in ("config", "menuconfig") and sym in sup.symbol_index:
+    if (node.kind in ("config", "menuconfig") and sym in sup.symbol_index
+            and sym not in _emitted_syms):
         entry  = sup.symbol_index[sym]
         in_sup = True
+        _emitted_syms.add(sym)
     elif node.kind in ("menu", "choice", "if", "comment"):
         # Structural nodes are auto-derived: emit whenever the subtree
         # contains suppressed symbols.  Entry from struct_index is used
@@ -1733,7 +1752,8 @@ def _walk_suppressed(
         out.append((node, entry, prefix, connector))
 
     for child in node.children:
-        _walk_suppressed(child, sup, child_pfx, node.children, out)
+        _walk_suppressed(child, sup, child_pfx, node.children, out,
+                         _emitted_syms)
 
 
 def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
@@ -1755,8 +1775,9 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
 
     # Collect (node, entry, prefix, connector) in Kconfig tree order
     ordered: list[tuple] = []
+    _emitted_syms: set = set()  # prevents duplicate symbols from dual-defined Kconfig entries
     for child in root.children:
-        _walk_suppressed(child, sup, "", root.children, ordered)
+        _walk_suppressed(child, sup, "", root.children, ordered, _emitted_syms)
 
     # Which node ids are explicitly in the suppressed file?
     sup_node_ids: set[int] = {id(node) for node, *_ in ordered}
