@@ -1176,32 +1176,41 @@ def _colour_line(node: KNode, prefix: str, connector: str,
 
 # -- menuconfig+if folding helpers --------------------------------------------
 
-def _folded_if(node: KNode) -> Optional[KNode]:
-    """Return the [if SYM] sibling to fold visually under this menuconfig.
+def _folded_ifs(node: KNode) -> list[KNode]:
+    """Return ALL [if SYM] siblings to fold visually under this menuconfig.
 
-    Folds only when:
-      - node is a menuconfig with a non-empty name
-      - the immediately following sibling is an if-node
-      - the if expression is a single bare symbol matching node.name
+    A sibling if-block is foldable when its expression is a single bare
+    symbol matching node.name.  There may be more than one such block
+    (e.g. [if USB] and [if USB (2)] under the same parent).
 
     Doc file only: suppressed file always uses flat Kconfig structure.
     """
     if node.kind != "menuconfig" or not node.name:
-        return None
+        return []
     parent = node.parent
     if parent is None:
-        return None
-    siblings = parent.children
-    idx = next((i for i, c in enumerate(siblings) if c is node), -1)
-    if idx < 0 or idx + 1 >= len(siblings):
-        return None
-    nxt = siblings[idx + 1]
-    if nxt.kind != "if" or not nxt.prompt.startswith("if "):
-        return None
-    sym_part = nxt.prompt[3:].strip()
-    if not _BARE_SYM_RE.match(sym_part):
-        return None
-    return nxt if sym_part == node.name else None
+        return []
+    return [
+        c for c in parent.children
+        if c is not node
+        and c.kind == "if"
+        and c.prompt.startswith("if ")
+        and _BARE_SYM_RE.match(c.prompt[3:].strip())
+        and c.prompt[3:].strip() == node.name
+    ]
+
+
+def _is_folded_if(child: KNode, parent_node: KNode) -> bool:
+    """True if child is an [if SYM] that should be folded under a menuconfig
+    sibling with the same symbol name.
+    """
+    if child.kind != "if" or not child.prompt.startswith("if "):
+        return False
+    sym = child.prompt[3:].strip()
+    if not _BARE_SYM_RE.match(sym):
+        return False
+    return any(c.kind == "menuconfig" and c.name == sym
+               for c in parent_node.children if c is not child)
 
 
 def _subtree_has_suppressed(node: KNode, symbol_index: dict) -> bool:
@@ -1454,9 +1463,8 @@ class Merger:
     def _has_visible_children(self, node: KNode) -> bool:
         children = node.children
         for i, child in enumerate(children):
-            # Folded-if: handled by the preceding menuconfig, skip here
-            if (child.kind == "if" and i > 0
-                    and _folded_if(children[i - 1]) is child):
+            # Folded-if: handled by the owning menuconfig, skip here
+            if _is_folded_if(child, node):
                 continue
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
@@ -1471,9 +1479,8 @@ class Merger:
         out = []
         children = node.children
         for i, child in enumerate(children):
-            # Folded-if: handled by the preceding menuconfig, skip here
-            if (child.kind == "if" and i > 0
-                    and _folded_if(children[i - 1]) is child):
+            # Folded-if: handled by the owning menuconfig, skip here
+            if _is_folded_if(child, node):
                 # Warn if the user put a descriptive comment on this
                 # if-entry in the doc file - it will never be shown.
                 key = _struct_node_key(child)
@@ -1481,10 +1488,16 @@ class Merger:
                 if _e and (_e.trailing_comment or _e.pre_group
                            or any(not g.is_freestanding()
                                   for g in _e.post_groups)):
+                    # Find the owning menuconfig for the warning message
+                    _mc = next((c for c in children
+                                if c.kind == "menuconfig"
+                                and c.name == child.prompt[3:].strip()),
+                               None)
+                    _mc_name = _mc.name if _mc else "?"
                     self.warnings.append(
                         f"Comment on [{child.occurrence_key}] in doc is "
                         f"unreachable -- the if-block is folded under "
-                        f"menuconfig {children[i-1].name}; "
+                        f"menuconfig {_mc_name}; "
                         f"move the comment to that menuconfig line")
                 continue
             if child.kind in ("config", "menuconfig"):
@@ -1603,10 +1616,10 @@ class Merger:
         if entry and entry.pre_group:
             self._emit_group(entry.pre_group, cmt_indent, is_pre=True)
 
-        # menuconfig folding: check for a foldable [if SYM] sibling
-        folded = _folded_if(node) if node.kind == "menuconfig" else None
-        has_folded_children = (folded is not None
-                               and self._has_visible_children(folded))
+        # menuconfig folding: collect all [if SYM] siblings to fold
+        folded_list = _folded_ifs(node) if node.kind == "menuconfig" else []
+        has_folded_children = any(self._has_visible_children(f)
+                                  for f in folded_list)
 
         trailing = entry.trailing_comment if entry else ""
         if has_folded_children:
@@ -1627,8 +1640,8 @@ class Merger:
         self._prev_emitted_parent = node.parent
 
         if node.kind == "menuconfig":
-            if folded is not None:
-                # Mark folded-if as header-emitted so its children
+            for folded in folded_list:
+                # Mark each folded-if as header-emitted so its children
                 # do not trigger the suppressed-parent blank logic.
                 self._struct_header_emitted.add(id(folded))
                 # Recurse into folded-if children at menuconfig child depth
