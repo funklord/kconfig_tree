@@ -937,6 +937,17 @@ class DocFileParser:
             # they are written for display context only and carry
             # no suppression effect.  Comments on them are dropped.
             if self.is_suppressed and own.startswith("if ") and "::" not in own:
+                # Warn if the user had a comment on this if-entry
+                _has_cmt = (entry.trailing_comment
+                            or entry.pre_group
+                            or any(not g.is_freestanding()
+                                   for g in entry.post_groups))
+                if _has_cmt:
+                    self.warnings.append(
+                        f"Comment on [{own}] in suppressed file was dropped "
+                        f"({self.path.name}:{entry.depth}) -- "
+                        f"if-entries are display-only context; "
+                        f"move the comment to the controlling config option")
                 depth_stack.append((d, own))
                 continue
 
@@ -1348,8 +1359,19 @@ class Merger:
         return self._eff_doc.get(sym) or self.sup.symbol_index.get(sym)
 
     def _struct_entry(self, node: KNode) -> Optional[RawEntry]:
-        key = _struct_node_key(node)
-        return self._eff_struct.get(key) or self.sup.struct_index.get(key)
+        key      = _struct_node_key(node)
+        doc_e    = self._eff_struct.get(key)
+        sup_e    = self.sup.struct_index.get(key)
+        # Warn when both files have a comment and they differ
+        if (doc_e and sup_e
+                and doc_e.trailing_comment
+                and sup_e.trailing_comment
+                and doc_e.trailing_comment != sup_e.trailing_comment):
+            self.warnings.append(
+                f"Comment conflict on structural node '{key}': "
+                f"doc has {doc_e.trailing_comment!r}, "
+                f"suppressed has {sup_e.trailing_comment!r} -- doc wins")
+        return doc_e or sup_e
 
     def _struct_has_desc_comment(self, node: KNode) -> bool:
         """True if this structural node has a descriptive comment
@@ -1441,6 +1463,18 @@ class Merger:
             # Folded-if: handled by the preceding menuconfig, skip here
             if (child.kind == "if" and i > 0
                     and _folded_if(children[i - 1]) is child):
+                # Warn if the user put a descriptive comment on this
+                # if-entry in the doc file - it will never be shown.
+                key = _struct_node_key(child)
+                _e  = self._eff_struct.get(key)
+                if _e and (_e.trailing_comment or _e.pre_group
+                           or any(not g.is_freestanding()
+                                  for g in _e.post_groups)):
+                    self.warnings.append(
+                        f"Comment on [{child.occurrence_key}] in doc is "
+                        f"unreachable -- the if-block is folded under "
+                        f"menuconfig {children[i-1].name}; "
+                        f"move the comment to that menuconfig line")
                 continue
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
