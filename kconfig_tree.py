@@ -103,22 +103,85 @@ def strip_ansi(s: str) -> str:
 
 # ── Tree drawing ───────────────────────────────────────────────────────────────
 
-PIPE  = "│ "
-TEE   = "├─"
-LAST  = "└─"
-BLANK = "  "
+class GlyphSet:
+    """All user-visible non-content glyphs in one place.
 
-_TREE_CHARS = set("│├└─ ")
+    PIPE / BLANK : per-depth prefix units — must be equal width.
+    TEE  / LAST  : per-node connectors    — must be equal width,
+                   may differ in width from PIPE/BLANK.
+    Swap the module-level G for ASCII mode via --ascii.
+    """
+    def __init__(self,
+                 pipe="│ ", tee="├", last="└", blank="  ",
+                 menu="▶",  choice="◆", header="⚙", expand="→",
+                 comment_bar="---"):
+        self.pipe        = pipe
+        self.tee         = tee
+        self.last        = last
+        self.blank       = blank
+        self.menu        = menu
+        self.choice      = choice
+        self.header      = header
+        self.expand      = expand
+        self.comment_bar = comment_bar
+        self._tree_chars: frozenset = frozenset(
+            c for s in (pipe, tee, last, blank) for c in s)
+
+    @property
+    def connector_width(self) -> int:
+        return len(self.tee)   # tee and last must be same width
+
+    @property
+    def pipe_width(self) -> int:
+        return len(self.pipe)  # pipe and blank must be same width
+
+    def strip_tree_prefix(self, line: str) -> tuple[str, str]:
+        i = 0
+        while i < len(line) and line[i] in self._tree_chars:
+            i += 1
+        return line[:i], line[i:]
+
+    def depth_of(self, plain: str) -> int:
+        prefix, _ = self.strip_tree_prefix(plain)
+        total = len(prefix)
+        cw    = self.connector_width
+        pw    = self.pipe_width
+        if total < cw:
+            return 0
+        return (total - cw) // pw
+
+    def comment_indent(self, prefix: str, is_last: bool) -> str:
+        """Return indentation for a comment anchored to a node.
+        '#' aligns with body text at column len(prefix)+connector_width.
+        is_last=True  → spaces     (no more siblings below)
+        is_last=False → pipe chars (more siblings follow)
+        """
+        cw        = self.connector_width
+        pipe_char = self.pipe[0]
+        cont      = (" " * cw) if is_last \
+                    else (pipe_char + " " * (cw - 1))
+        return prefix + cont
+
+
+# UTF-8 default — TEE/LAST are 1 char (no trailing ─)
+G = GlyphSet()
+
+# ASCII alternative — activated with --ascii
+_ASCII_GLYPHS = GlyphSet(
+    pipe="| ", tee="+", last="+", blank="  ",
+    menu=">",  choice="+", header="*", expand="->",
+    comment_bar="---",
+)
+
 
 def _strip_tree_prefix(line: str) -> tuple[str, str]:
-    i = 0
-    while i < len(line) and line[i] in _TREE_CHARS:
-        i += 1
-    return line[:i], line[i:]
+    return G.strip_tree_prefix(line)
 
 def _depth_of(plain: str) -> int:
-    prefix, _ = _strip_tree_prefix(plain)
-    return len(prefix) // 2
+    return G.depth_of(plain)
+
+def _comment_indent(prefix: str, connector: str) -> str:
+    return G.comment_indent(prefix, connector == G.last)
 
 
 # ── KNode ─────────────────────────────────────────────────────────────────────
@@ -518,7 +581,13 @@ _TRAILING_CMT_RE = re.compile(r" (#.*)$")
 _BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
 _DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
 _DOTCFG_UNSET_RE = re.compile(r"^#\s+(CONFIG_\w+)\s+is not set\s*$")
-_STRUCT_LEADER   = re.compile(r"^(▶ |◆ |--- |\[if )")
+def _build_struct_leader() -> re.Pattern:
+    m  = re.escape(G.menu)
+    c  = re.escape(G.choice)
+    cb = re.escape(G.comment_bar)
+    return re.compile(rf"^({m} |{c} |{cb} |\[if )")
+
+_STRUCT_LEADER = _build_struct_leader()
 _KCONFIG_CMT_RE  = re.compile(r"^--- (.+) ---$")
 
 
@@ -589,10 +658,15 @@ def _struct_prompt_key(content_clean: str) -> str:
         if inner.endswith("]"):
             inner = inner[:-1]     # strip trailing ]
         return inner.strip()
-    s = _STRUCT_LEADER.sub("", content_clean, count=1)
-    s = _KCONFIG_CMT_RE.sub(r"\1", s)  # '--- text ---' full match
-    if s.endswith(" ---"):              # trailing --- after leader strip
-        s = s[:-4]
+    s  = _STRUCT_LEADER.sub("", content_clean, count=1)
+    cb = G.comment_bar
+    import re as _re
+    m  = _re.match(rf"^{_re.escape(cb)} (.+) {_re.escape(cb)}$",
+                   content_clean)
+    if m:
+        return m.group(1).strip()
+    if s.endswith(" " + cb):
+        s = s[:-(len(cb) + 1)]
     return s.strip()
 
 
@@ -971,19 +1045,6 @@ def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
 
 # ── Comment indentation helpers ───────────────────────────────────────────────
 
-def _comment_indent(prefix: str, connector: str) -> str:
-    """
-    Return the indentation for a comment anchored to a node.
-    '#' must align with the body text of the anchor node.
-
-    The anchor node's body starts at column len(prefix) + len(connector).
-    The continuation prefix that visually belongs under that node is:
-      prefix + PIPE  when connector == TEE  (node has more siblings after it)
-      prefix + BLANK when connector == LAST (node is the last child)
-    Both PIPE and BLANK are the same width as TEE/LAST, so '#' lands on
-    the same column as the body text.
-    """
-    return prefix + (BLANK if connector == LAST else PIPE)
 
 
 def _emit_comment_group(push_fn, push_blank_fn,
@@ -1023,9 +1084,9 @@ def _emit_comment_group(push_fn, push_blank_fn,
 def _plain_body(node: KNode, num_cols: int = 1) -> str:
     glyph = node.raw_glyph(num_cols)
     if node.kind == "menu":
-        return f"▶ {node.prompt}" if node.prompt else "▶ (menu)"
+        return f"{G.menu} {node.prompt}" if node.prompt else f"{G.menu} (menu)"
     if node.kind == "choice":
-        return f"◆ {node.prompt or '(choice)'}"
+        return f"{G.choice} {node.prompt or '(choice)'}"
     if node.kind == "comment":
         return f"--- {node.prompt} ---"
     if node.kind == "if":
@@ -1038,10 +1099,10 @@ def _plain_body(node: KNode, num_cols: int = 1) -> str:
 def _colour_body(node: KNode, num_cols: int = 1) -> str:
     glyph = node.coloured_glyph(num_cols)
     if node.kind == "menu":
-        p = f"▶ {node.prompt}" if node.prompt else "▶ (menu)"
+        p = f"{G.menu} {node.prompt}" if node.prompt else f"{G.menu} (menu)"
         return bold(cyan(p))
     if node.kind == "choice":
-        return bold(f"◆ {node.prompt or '(choice)'}")
+        return bold(f"{G.choice} {node.prompt or '(choice)'}")
     if node.kind == "comment":
         return gray(f"--- {node.prompt} ---")
     if node.kind == "if":
@@ -1233,7 +1294,7 @@ class Merger:
     # ── tree walk ──────────────────────────────────────────────────────────────
 
     def run(self) -> list[OutputLine]:
-        hdr = f"⚙ {self.root.prompt or 'Linux Kernel Configuration'}"
+        hdr = f"{G.header} {self.root.prompt or 'Linux Kernel Configuration'}"
         self._push(hdr, bold(cyan(hdr)))
         # Mark the root as having its header emitted so root-level
         # config nodes don't trigger the suppressed-parent blank.
@@ -1327,8 +1388,8 @@ class Merger:
         children = self._visible_children(parent)
         for idx, child in enumerate(children):
             is_last   = idx == len(children) - 1
-            connector = LAST if is_last else TEE
-            child_pfx = prefix + (BLANK if is_last else PIPE)
+            connector = G.last if is_last else G.tee
+            child_pfx = prefix + (G.blank if is_last else G.pipe)
             self._emit_child(child, prefix, connector, child_pfx)
 
     def _emit_child(self, node: KNode, prefix: str, connector: str,
@@ -1514,8 +1575,8 @@ def _walk_suppressed(
         is_last = (node is parent_children[-1])
     else:
         is_last = True
-    connector = LAST if is_last else TEE
-    child_pfx = prefix + (BLANK if is_last else PIPE)
+    connector = G.last if is_last else G.tee
+    child_pfx = prefix + (G.blank if is_last else G.pipe)
 
     in_sup = False
     entry  = None
@@ -1687,6 +1748,10 @@ def main():
 
     if args.no_color or args.emit_kconfig:
         USE_COLOR = False
+    if args.ascii:
+        global G, _STRUCT_LEADER
+        G = _ASCII_GLYPHS
+        _STRUCT_LEADER = _build_struct_leader()
 
     kernel_root    = Path(".").resolve()
     kconfig_path   = Path(args.kconfig)
