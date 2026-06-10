@@ -592,10 +592,11 @@ def build_struct_knode_index(
 #   3. Anchored-below (pre,  blank above)     -> pre_group
 #   4. Freestanding (post, blank above+below) -> post_groups, is_freestanding()
 
-_DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
+_DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:->|→)?\s*(?:#.*)?$")
 _SYMBOL_TAG_RE   = re.compile(r"\((\w+)\)")  # tag only, no trailing
 _TRAILING_CMT_RE = re.compile(r" (#.*)$")
 _BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
+_BARE_SYM_RE     = re.compile(r"^\w+$")  # single bare identifier
 _DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
 _DOTCFG_UNSET_RE = re.compile(r"^#\s+(CONFIG_\w+)\s+is not set\s*$")
 def _build_struct_leader() -> re.Pattern:
@@ -713,9 +714,11 @@ class DocFileParser:
     """
 
     def __init__(self, path: Path, knode_index: dict[str, KNode],
-                 struct_knode_index: Optional[dict[str, list[KNode]]] = None):
+                 struct_knode_index: Optional[dict[str, list[KNode]]] = None,
+                 is_suppressed: bool = False):
         self.path = path
         self.knode_index = knode_index
+        self.is_suppressed = is_suppressed
         self.struct_knode_index: dict[str, list[KNode]] = struct_knode_index or {}
         self.symbol_index: dict[str, RawEntry] = {}
         self.struct_index: dict[str, RawEntry] = {}
@@ -930,6 +933,13 @@ class DocFileParser:
             while depth_stack and depth_stack[-1][0] >= d:
                 depth_stack.pop()
 
+            # Skip if-entries in suppressed file entirely:
+            # they are written for display context only and carry
+            # no suppression effect.  Comments on them are dropped.
+            if self.is_suppressed and own.startswith("if ") and "::" not in own:
+                depth_stack.append((d, own))
+                continue
+
             matching = self.struct_knode_index.get(own, [])
             if len(matching) == 1:
                 # Unambiguous: use Kconfig tree directly.
@@ -1142,6 +1152,45 @@ def _colour_line(node: KNode, prefix: str, connector: str,
     return f"{prefix}{connector}{_colour_body(node, num_cols)}{tc}"
 
 
+# -- menuconfig+if folding helpers --------------------------------------------
+
+def _folded_if(node: KNode) -> Optional[KNode]:
+    """Return the [if SYM] sibling to fold visually under this menuconfig.
+
+    Folds only when:
+      - node is a menuconfig with a non-empty name
+      - the immediately following sibling is an if-node
+      - the if expression is a single bare symbol matching node.name
+
+    Doc file only: suppressed file always uses flat Kconfig structure.
+    """
+    if node.kind != "menuconfig" or not node.name:
+        return None
+    parent = node.parent
+    if parent is None:
+        return None
+    siblings = parent.children
+    idx = next((i for i, c in enumerate(siblings) if c is node), -1)
+    if idx < 0 or idx + 1 >= len(siblings):
+        return None
+    nxt = siblings[idx + 1]
+    if nxt.kind != "if" or not nxt.prompt.startswith("if "):
+        return None
+    sym_part = nxt.prompt[3:].strip()
+    if not _BARE_SYM_RE.match(sym_part):
+        return None
+    return nxt if sym_part == node.name else None
+
+
+def _subtree_has_suppressed(node: KNode, symbol_index: dict) -> bool:
+    """True if any config/menuconfig in node's subtree is in symbol_index."""
+    sym = node.symbol()
+    if sym and sym in symbol_index:
+        return True
+    return any(_subtree_has_suppressed(c, symbol_index)
+               for c in node.children)
+
+
 # -- OutputLine -----------------------------------------------------------------
 
 @dataclass
@@ -1302,11 +1351,26 @@ class Merger:
         key = _struct_node_key(node)
         return self._eff_struct.get(key) or self.sup.struct_index.get(key)
 
-    def _is_struct_suppressed(self, node: KNode) -> bool:
-        if self.full:
+    def _struct_has_desc_comment(self, node: KNode) -> bool:
+        """True if this structural node has a descriptive comment
+        (types 1, 2, 3 — trailing, anchored-above, anchored-below).
+        Freestanding type-4 comments do NOT count: they belong to no
+        specific node and are positional best-effort.
+        Used for the comment exception: keep a childless structural
+        node visible when the user has annotated it.
+        """
+        entry = self._struct_entry(node)
+        if not entry:
             return False
-        return _struct_node_key(node) in self.sup.struct_index
+        if entry.trailing_comment:
+            return True
+        if entry.pre_group:
+            return True
+        return any(not g.is_freestanding() for g in entry.post_groups)
 
+    # _is_struct_suppressed removed: structural nodes are never hidden
+    # from the doc by the suppressed file.  Visibility is controlled
+    # purely by whether there are visible children or a descriptive comment.
 
     # -- tree walk --------------------------------------------------------------
 
@@ -1351,29 +1415,33 @@ class Merger:
                     f"Conflict: {sym} in both doc and suppressed "
                     f"- doc wins, removing from suppressed")
 
-    def _is_struct_in_doc(self, node: KNode) -> bool:
-        """True if this structural node is explicitly in the effective doc.
-        Such nodes are always kept even if all their children are suppressed."""
-        return _struct_node_key(node) in self._eff_struct
+    # _is_struct_in_doc removed: the comment exception is now handled
+    # by _struct_has_desc_comment, which checks the actual comment content.
 
     def _has_visible_children(self, node: KNode) -> bool:
-        for child in node.children:
+        children = node.children
+        for i, child in enumerate(children):
+            # Folded-if: handled by the preceding menuconfig, skip here
+            if (child.kind == "if" and i > 0
+                    and _folded_if(children[i - 1]) is child):
+                continue
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
                     return True
-            elif child.kind in ("menu", "choice", "if"):
-                # A structural node is visible if it is explicitly in the
-                # doc (even with no children) OR has visible descendants.
-                if (self._is_struct_in_doc(child)
-                        or self._has_visible_children(child)):
+            elif child.kind in ("menu", "choice", "if", "comment"):
+                if (self._has_visible_children(child)
+                        or self._struct_has_desc_comment(child)):
                     return True
-            elif child.kind == "comment":
-                return True
         return False
 
     def _visible_children(self, node: KNode) -> list[KNode]:
         out = []
-        for child in node.children:
+        children = node.children
+        for i, child in enumerate(children):
+            # Folded-if: handled by the preceding menuconfig, skip here
+            if (child.kind == "if" and i > 0
+                    and _folded_if(children[i - 1]) is child):
+                continue
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
                     out.append(child)
@@ -1391,14 +1459,13 @@ class Merger:
                             self.notices.append(
                                 f"Active option not tracked: {sym} "
                                 f"(use --add-new-enabled or --add-new)")
-            elif child.kind in ("menu", "choice", "if"):
-                # Include structural nodes that are explicitly in the doc
-                # (even if childless) OR have visible descendants.
-                if (self._is_struct_in_doc(child)
-                        or self._has_visible_children(child)):
+            elif child.kind in ("menu", "choice", "if", "comment"):
+                # Visible when: has visible children OR has a descriptive
+                # comment (the comment exception keeps annotated nodes
+                # visible even when all children are suppressed).
+                if (self._has_visible_children(child)
+                        or self._struct_has_desc_comment(child)):
                     out.append(child)
-            elif child.kind == "comment":
-                out.append(child)
         return out
 
     def _recurse(self, parent: KNode, prefix: str):
@@ -1418,17 +1485,19 @@ class Merger:
         # -- structural nodes ---------------------------------------------------
         if node.kind in ("menu", "choice", "if", "comment"):
             nid = id(node)
-            suppressed = self._is_struct_suppressed(node)
             if nid in self._struct_emitted:
                 self._recurse(node, child_pfx)
                 return
             self._struct_emitted.add(nid)
 
-            if suppressed:
-                # Header suppressed: don't emit it, don't record it.
-                # _struct_header_emitted will NOT contain this node's id,
-                # so children will get a blank if their parent differs.
-                self._recurse(node, child_pfx)
+            # Structural nodes are always shown when they have visible
+            # children OR a descriptive comment.  They cannot be suppressed
+            # by the suppressed file - only symbol entries control visibility.
+            has_children = self._has_visible_children(node)
+            has_comment  = self._struct_has_desc_comment(node)
+            if not has_children and not has_comment:
+                # Nothing to show - not reachable via _visible_children,
+                # but guard here for safety.
                 return
 
             entry = self._struct_entry(node)
@@ -1489,7 +1558,15 @@ class Merger:
         if entry and entry.pre_group:
             self._emit_group(entry.pre_group, cmt_indent, is_pre=True)
 
+        # menuconfig folding: check for a foldable [if SYM] sibling
+        folded = _folded_if(node) if node.kind == "menuconfig" else None
+        has_folded_children = (folded is not None
+                               and self._has_visible_children(folded))
+
         trailing = entry.trailing_comment if entry else ""
+        if has_folded_children:
+            # Prepend expand marker before any trailing comment
+            trailing = (G.expand + " " + trailing) if trailing else G.expand
         self._push(_plain_line(node, prefix, connector, trailing, self.num_cols),
                    _colour_line(node, prefix, connector, trailing, self.num_cols),
                    symbol=sym)
@@ -1504,8 +1581,16 @@ class Merger:
 
         self._prev_emitted_parent = node.parent
 
-        if node.kind == "menuconfig" and node.children:
-            self._recurse(node, child_pfx)
+        if node.kind == "menuconfig":
+            if folded is not None:
+                # Mark folded-if as header-emitted so its children
+                # do not trigger the suppressed-parent blank logic.
+                self._struct_header_emitted.add(id(folded))
+                # Recurse into folded-if children at menuconfig child depth
+                self._recurse(folded, child_pfx)
+            # Also recurse into any direct children of the menuconfig itself
+            if node.children:
+                self._recurse(node, child_pfx)
 
 
 # -- Suppressed file update ----------------------------------------------------
@@ -1601,9 +1686,13 @@ def _walk_suppressed(
         entry  = sup.symbol_index[sym]
         in_sup = True
     elif node.kind in ("menu", "choice", "if", "comment"):
-        nkey = _struct_node_key(node)
-        if nkey in sup.struct_index:
-            entry  = sup.struct_index[nkey]
+        # Structural nodes are auto-derived: emit whenever the subtree
+        # contains suppressed symbols.  Entry from struct_index is used
+        # for comment recovery (menu/choice/comment only; if-entries
+        # are not indexed from suppressed files so entry will be None).
+        if _subtree_has_suppressed(node, sup.symbol_index):
+            nkey  = _struct_node_key(node)
+            entry = sup.struct_index.get(nkey)  # None is fine
             in_sup = True
 
     if in_sup:
@@ -1822,7 +1911,8 @@ def main():
 
     if sup_path.exists():
         print(f"Reading {sup_path} ...", file=sys.stderr)
-    sup = DocFileParser(sup_path, knode_index, struct_knode_index)
+    sup = DocFileParser(sup_path, knode_index, struct_knode_index,
+                        is_suppressed=True)
 
     combined_max: dict[str, int] = {}
     for expr, n in {**doc.max_if_occurrences, **sup.max_if_occurrences}.items():
