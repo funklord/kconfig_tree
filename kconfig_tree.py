@@ -1,65 +1,65 @@
 #!/usr/bin/env python3
 """
-kconfig_tree.py — Kernel configuration documentation tool.
+kconfig_tree.py - Kernel configuration documentation tool.
 
 THREE-FILE MODEL
-────────────────
+----------------
   .config                     Kernel truth (what is active)
   kconfig_doc.txt             User allowlist (what to show and document)
   kconfig_doc_suppressed.txt  User denylist (what to permanently hide)
 
 MERGE RULES
-───────────
-  In doc                    → emit, update glyph, warn on value mismatch
-  In suppressed             → never emit (unless --full)
-  In neither, inactive      → silent
-  In neither, active        → notice on stderr (suggest --add-new-enabled)
-  In both (conflict)        → doc wins, warn, remove from suppressed
-  --add-new                 → add all symbols in neither file
-  --add-new-enabled         → add only [*]/[M] symbols in neither file
-  --full                    → merge suppressed→doc, add all remaining
+-----------
+  In doc                    -> emit, update glyph, warn on value mismatch
+  In suppressed             -> never emit (unless --full)
+  In neither, inactive      -> silent
+  In neither, active        -> notice on stderr (suggest --add-new-enabled)
+  In both (conflict)        -> doc wins, warn, remove from suppressed
+  --add-new                 -> add all symbols in neither file
+  --add-new-enabled         -> add only [*]/[M] symbols in neither file
+  --full                    -> merge suppressed->doc, add all remaining
 
 INPUT FORMATS ACCEPTED IN DOC / SUPPRESSED FILES
-─────────────────────────────────────────────────
-  Full doc:      ├─[*] Some prompt (SYMBOL) # trailing comment
+-------------------------------------------------
+  Full doc:      +-[*] Some prompt (SYMBOL) # trailing comment
   Bare symbol:   CONFIG_SYMBOL  # optional trailing comment
   .config set:   CONFIG_SYMBOL=y
   .config unset: # CONFIG_SYMBOL is not set
   Pure comment:  # free text
 
 FOUR COMMENT TYPES
-──────────────────
-  1. Trailing   — on the same line as a node after node info
-  2. Anchored-above — directly below a node (no blank between)
+------------------
+  1. Trailing   - on the same line as a node after node info
+  2. Anchored-above - directly below a node (no blank between)
                       indented to body column of that node
                       optional blank below is preserved
-  3. Anchored-below — blank line above + node directly below (no blank between)
+  3. Anchored-below - blank line above + node directly below (no blank between)
                       indented to body column of that node
                       blank above is preserved
-  4. Freestanding   — blank above AND blank below
+  4. Freestanding   - blank above AND blank below
                       no tree indentation (written at column 0)
                       anchored to node above for stability
                       both surrounding blanks preserved
                       blanks between lines in the group collapsed to one
 
 ORPHAN SPACING
-──────────────
+--------------
   A blank line is inserted between two config/menuconfig nodes from
   completely different subtrees so the tree cannot be visually misread.
 
 USAGE
-─────
+-----
   python3 kconfig_tree.py --add-new-enabled   # first run, active options only
   python3 kconfig_tree.py --full              # first run, everything
   python3 kconfig_tree.py                     # normal update
   python3 kconfig_tree.py --show              # view coloured tree
   python3 kconfig_tree.py --emit-kconfig > my.config
 
-  Suppress: move line from doc → suppressed file
+  Suppress: move line from doc -> suppressed file
   Un-suppress: delete line from suppressed file
 
 OPTIONS
-───────
+-------
   --kconfig    PATH   Top-level Kconfig file        (default: Kconfig)
   --dotconfig  PATH   Kernel .config file           (default: .config)
   --doc        PATH   Doc file                      (default: kconfig_doc.txt)
@@ -83,7 +83,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-# ── ANSI colour helpers ────────────────────────────────────────────────────────
+# -- ANSI colour helpers --------------------------------------------------------
 
 USE_COLOR = True
 
@@ -101,19 +101,19 @@ ANSI_RE = re.compile(r"\033\[[0-9;]*m")
 def strip_ansi(s: str) -> str:
     return ANSI_RE.sub("", s)
 
-# ── Tree drawing ───────────────────────────────────────────────────────────────
+# -- Tree drawing ---------------------------------------------------------------
 
 class GlyphSet:
     """All user-visible non-content glyphs in one place.
 
-    PIPE / BLANK : per-depth prefix units — must be equal width.
-    TEE  / LAST  : per-node connectors    — must be equal width,
+    PIPE / BLANK : per-depth prefix units - must be equal width.
+    TEE  / LAST  : per-node connectors    - must be equal width,
                    may differ in width from PIPE/BLANK.
     Swap the module-level G for ASCII mode via --ascii.
     """
     def __init__(self,
-                 pipe="│ ", tee="├", last="└", blank="  ",
-                 menu="▶",  choice="◆", header="⚙", expand="→",
+                 pipe="│",  tee="├", last="└", blank=" ",
+                 menu="▶",  choice="◆", header="⚙", expand="->",
                  comment_bar="---"):
         self.pipe        = pipe
         self.tee         = tee
@@ -153,8 +153,8 @@ class GlyphSet:
     def comment_indent(self, prefix: str, is_last: bool) -> str:
         """Return indentation for a comment anchored to a node.
         '#' aligns with body text at column len(prefix)+connector_width.
-        is_last=True  → spaces     (no more siblings below)
-        is_last=False → pipe chars (more siblings follow)
+        is_last=True  -> spaces     (no more siblings below)
+        is_last=False -> pipe chars (more siblings follow)
         """
         cw        = self.connector_width
         pipe_char = self.pipe[0]
@@ -163,15 +163,32 @@ class GlyphSet:
         return prefix + cont
 
 
-# UTF-8 default — TEE/LAST are 1 char (no trailing ─)
-G = GlyphSet()
+# Per-level tree indent width in characters.
+# 1 = compact (default): each depth level is exactly 1 char wide.
+# 2 = classic: pipe="| " blank="  " (one trailing space per level).
+# Increase for wider, more readable trees on wide terminals.
+TREE_INDENT_WIDTH = 1
 
-# ASCII alternative — activated with --ascii
-_ASCII_GLYPHS = GlyphSet(
-    pipe="| ", tee="+", last="+", blank="  ",
-    menu=">",  choice="+", header="*", expand="->",
-    comment_bar="---",
-)
+
+def _make_glyphset(pipe_char: str, **kwargs) -> GlyphSet:
+    """Build a GlyphSet with pipe/blank scaled to TREE_INDENT_WIDTH."""
+    n = max(1, TREE_INDENT_WIDTH)
+    return GlyphSet(
+        pipe=pipe_char + " " * (n - 1),
+        blank=" " * n,
+        **kwargs,
+    )
+
+
+# UTF-8 default - TEE/LAST are 1 char (no trailing -)
+G = _make_glyphset("│", tee="├", last="└",
+                   menu="▶",  choice="◆", header="⚙", expand="->",
+                   comment_bar="---")
+
+# ASCII alternative - activated with --ascii
+_ASCII_GLYPHS = _make_glyphset("|", tee="+", last="+",
+                               menu=">", choice="+", header="*", expand="->",
+                               comment_bar="---")
 
 
 def _strip_tree_prefix(line: str) -> tuple[str, str]:
@@ -184,7 +201,7 @@ def _comment_indent(prefix: str, connector: str) -> str:
     return G.comment_indent(prefix, connector == G.last)
 
 
-# ── KNode ─────────────────────────────────────────────────────────────────────
+# -- KNode ---------------------------------------------------------------------
 
 @dataclass
 class KNode:
@@ -277,7 +294,7 @@ class KNode:
         return chain
 
 
-# ── Kconfig parser ─────────────────────────────────────────────────────────────
+# -- Kconfig parser -------------------------------------------------------------
 
 _BLANK_RE    = re.compile(r"^\s*$")
 _HASH_RE     = re.compile(r"^\s*#")
@@ -459,12 +476,12 @@ class KconfigParser:
             _ATTR_RE.match(line)
 
 
-# ── .config loader ─────────────────────────────────────────────────────────────
+# -- .config loader -------------------------------------------------------------
 
 def load_dotconfig(path: Path) -> dict[str, str]:
     cfg: dict[str, str] = {}
     if not path.exists():
-        print(f"WARNING: {path} not found — values will show as unset.",
+        print(f"WARNING: {path} not found - values will show as unset.",
               file=sys.stderr)
         return cfg
     for line in path.read_text(errors="replace").splitlines():
@@ -549,7 +566,7 @@ def _parse_if_occurrence(key: str) -> tuple[str, int]:
 def build_struct_knode_index(
         node: KNode,
         idx:  Optional[dict] = None) -> dict[str, list[KNode]]:
-    """Build own_prompt → [KNode, ...] index for structural nodes.
+    """Build own_prompt -> [KNode, ...] index for structural nodes.
     Used by DocFileParser to resolve single-level prompt strings to the
     correct two-level key via _struct_node_key, even when the parent node
     is absent from the doc/suppressed file.
@@ -567,13 +584,13 @@ def build_struct_knode_index(
     return idx
 
 
-# ── Doc / suppressed file parser ───────────────────────────────────────────────
+# -- Doc / suppressed file parser -----------------------------------------------
 #
 # Four comment types (stored in RawEntry):
-#   1. Trailing   — trailing_comment field (same line, already handled)
-#   2. Anchored-above (post, no blank above)  → post_groups, not freestanding
-#   3. Anchored-below (pre,  blank above)     → pre_group
-#   4. Freestanding (post, blank above+below) → post_groups, is_freestanding()
+#   1. Trailing   - trailing_comment field (same line, already handled)
+#   2. Anchored-above (post, no blank above)  -> post_groups, not freestanding
+#   3. Anchored-below (pre,  blank above)     -> pre_group
+#   4. Freestanding (post, blank above+below) -> post_groups, is_freestanding()
 
 _DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:#.*)?$")
 _SYMBOL_TAG_RE   = re.compile(r"\((\w+)\)")  # tag only, no trailing
@@ -645,11 +662,11 @@ def _struct_prompt_key(content_clean: str) -> str:
     """Normalise a structural doc line's content to the key used by the
     Merger (= KNode.prompt.strip()) so that struct_index lookups match.
 
-    Display format → KNode.prompt:
-      ▶ General setup          → General setup
-      ◆ Kernel compression     → (choice)
-      --- Some comment ---     → Some comment
-      [if CEPH_FS]             → if CEPH_FS   (must keep 'if ' prefix)
+    Display format -> KNode.prompt:
+      > General setup          -> General setup
+      * Kernel compression     -> (choice)
+      --- Some comment ---     -> Some comment
+      [if CEPH_FS]             -> if CEPH_FS   (must keep 'if ' prefix)
     """
     # [if EXPR] blocks: strip enclosing brackets, keep 'if EXPR' intact
     # so the key matches KNode.prompt which is stored as 'if EXPR'.
@@ -714,7 +731,7 @@ class DocFileParser:
 
         raw_lines = self.path.read_text(errors="replace").splitlines()
 
-        # ── Pass 1: classify every line ───────────────────────────────────────
+        # -- Pass 1: classify every line ---------------------------------------
 
         items: list[tuple] = []   # ("option", RawEntry) | ("comment", str) | ("blank",)
 
@@ -759,7 +776,7 @@ class DocFileParser:
                 continue
 
             # Check structural leader BEFORE _DOC_SYMBOL_RE so that
-            # e.g. "◆ Link Time Optimization (LTO)" is never mis-parsed
+            # e.g. "* Link Time Optimization (LTO)" is never mis-parsed
             # as CONFIG_LTO.
             if _STRUCT_LEADER.match(content_clean):
                 prompt_key = _struct_prompt_key(content_clean)
@@ -792,15 +809,15 @@ class DocFileParser:
 
             items.append(("comment", content))
 
-        # ── Pass 2: resolve comment anchoring ─────────────────────────────────
+        # -- Pass 2: resolve comment anchoring ---------------------------------
         #
         # For each contiguous comment run, classify by context:
         #
-        #   blank_above=F, next_is_option=—  → type 2 (anchored-above / post)
-        #   blank_above=T, next_is_option=T  → type 3 (anchored-below / pre)
-        #   blank_above=T, blank_below=T     → type 4 (freestanding / post)
+        #   blank_above=F, next_is_option=-  -> type 2 (anchored-above / post)
+        #   blank_above=T, next_is_option=T  -> type 3 (anchored-below / pre)
+        #   blank_above=T, blank_below=T     -> type 4 (freestanding / post)
         #
-        # Note: type 4 wins over type 3 — if there's a blank below too,
+        # Note: type 4 wins over type 3 - if there's a blank below too,
         # it is freestanding regardless of what follows after the blank.
 
         n = len(items)
@@ -837,23 +854,23 @@ class DocFileParser:
                                  blank_below=blank_below)
 
             if blank_above and blank_below:
-                # Type 4: freestanding — append to post_groups of option above
+                # Type 4: freestanding - append to post_groups of option above
                 if option_entries:
                     option_entries[-1].post_groups.append(group)
                 # else: before any option, discard
 
             elif blank_above and next_is_option:
-                # Type 3: anchored-below — attach as pre_group to option below
+                # Type 3: anchored-below - attach as pre_group to option below
                 next_entry = items[i][1]
                 next_entry.pre_group = group
 
             else:
-                # Type 2: anchored-above — append to post_groups of option above
+                # Type 2: anchored-above - append to post_groups of option above
                 if option_entries:
                     option_entries[-1].post_groups.append(group)
                 # else: discard
 
-        # ── Pass 3a: index all CONFIG_ symbols first ─────────────────────────
+        # -- Pass 3a: index all CONFIG_ symbols first -------------------------
         # We do symbols before structural nodes so that during structural
         # disambiguation (Pass 3b) we can check which candidate's subtree
         # contains the symbols that appear in this file.  This is much more
@@ -870,9 +887,9 @@ class DocFileParser:
             else:
                 self.warnings.append(
                     f"Duplicate symbol {entry.symbol} in "
-                    f"{self.path.name} — keeping first")
+                    f"{self.path.name} - keeping first")
 
-        # ── Pass 3b: index structural entries ─────────────────────────────────
+        # -- Pass 3b: index structural entries ---------------------------------
         # Now that symbol_index is complete, disambiguate duplicate structural
         # prompts by finding which candidate's subtree contains the most
         # (or any) symbols already present in symbol_index.
@@ -919,7 +936,7 @@ class DocFileParser:
                 key = _struct_node_key(matching[0])
             elif len(matching) > 1:
                 # Multiple candidates with the same prompt.
-                # Strategy 1: descendant count — the candidate whose subtree
+                # Strategy 1: descendant count - the candidate whose subtree
                 # contains the most indexed symbols wins.  Works when the
                 # structural node's children are present in the file.
                 scored = [(len(_desc_in_index(m)), m) for m in matching]
@@ -966,7 +983,7 @@ class DocFileParser:
                 self.struct_index[key] = entry
                 self.ordered.append(entry)
             # Track highest occurrence number seen for change detection.
-            # Only for genuine 'if' node keys — exclude two-level keys such as
+            # Only for genuine 'if' node keys - exclude two-level keys such as
             # "if EXPR::Child prompt" where the parent happens to be an if-block.
             if key.startswith("if ") and "::" not in key:
                 base_expr, n = _parse_if_occurrence(key)
@@ -974,11 +991,11 @@ class DocFileParser:
                     self.max_if_occurrences.get(base_expr, 0), n)
             depth_stack.append((d, own))
 
-        # ── Pass 4: validate against Kconfig tree ─────────────────────────────
+        # -- Pass 4: validate against Kconfig tree -----------------------------
         # Unknown symbols:
-        #   - with attached comments → moved to dead_entries, emitted inline as
+        #   - with attached comments -> moved to dead_entries, emitted inline as
         #     type-2 anchored comments beside their preceding known option
-        #   - without comments       → silently dropped (no warning, no stub)
+        #   - without comments       -> silently dropped (no warning, no stub)
 
         unknown_syms = {sym for sym in self.symbol_index
                         if sym not in self.knode_index}
@@ -999,12 +1016,12 @@ class DocFileParser:
                 self.dead_entries.append(entry)
                 self.warnings.append(
                     f"Symbol {sym} in {self.path.name} not found in "
-                    f"Kconfig tree — converted to inline comment")
+                    f"Kconfig tree - converted to inline comment")
             # else: silently dropped
             del self.symbol_index[sym]
         self.ordered = [e for e in self.ordered if e.symbol not in unknown_syms]
 
-        # ── Pass 5: value mismatch warnings ───────────────────────────────────
+        # -- Pass 5: value mismatch warnings -----------------------------------
 
         for sym, entry in self.symbol_index.items():
             if not entry.file_value:
@@ -1017,16 +1034,16 @@ class DocFileParser:
             if fv != live and fv not in ("", "n") and live not in ("", "n"):
                 self.warnings.append(
                     f"Value mismatch for {sym}: "
-                    f"file has ={fv}, .config has ={live} — using .config value")
+                    f"file has ={fv}, .config has ={live} - using .config value")
 
 
-# ── Ancestry / orphan-blank ───────────────────────────────────────────────────
+# -- Ancestry / orphan-blank ---------------------------------------------------
 
 def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
     """
     True when a blank should be inserted between prev and curr because
     they come from completely different subtrees.
-    Only fires for config/menuconfig nodes — structural nodes never set
+    Only fires for config/menuconfig nodes - structural nodes never set
     prev_node, so they can't trigger orphan blanks.
     """
     if prev_node is None:
@@ -1043,7 +1060,7 @@ def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
     return len(non_root_shared) == 0
 
 
-# ── Comment indentation helpers ───────────────────────────────────────────────
+# -- Comment indentation helpers -----------------------------------------------
 
 
 
@@ -1079,7 +1096,7 @@ def _emit_comment_group(push_fn, push_blank_fn,
             push_fn(plain, coloured_line)
 
 
-# ── Line renderers ─────────────────────────────────────────────────────────────
+# -- Line renderers -------------------------------------------------------------
 
 def _plain_body(node: KNode, num_cols: int = 1) -> str:
     glyph = node.raw_glyph(num_cols)
@@ -1125,7 +1142,7 @@ def _colour_line(node: KNode, prefix: str, connector: str,
     return f"{prefix}{connector}{_colour_body(node, num_cols)}{tc}"
 
 
-# ── OutputLine ─────────────────────────────────────────────────────────────────
+# -- OutputLine -----------------------------------------------------------------
 
 @dataclass
 class OutputLine:
@@ -1141,7 +1158,7 @@ def _blank_line() -> OutputLine:
     return OutputLine(plain="", coloured="", is_blank=True)
 
 
-# ── Merger ─────────────────────────────────────────────────────────────────────
+# -- Merger ---------------------------------------------------------------------
 
 class Merger:
     def __init__(
@@ -1206,7 +1223,7 @@ class Merger:
                 self._rootless_dead.append(dead_entry)
 
 
-    # ── internal push helpers ──────────────────────────────────────────────────
+    # -- internal push helpers --------------------------------------------------
 
     def _push(self, plain: str, coloured: str, symbol: str = "",
               is_notice: bool = False, is_warning: bool = False):
@@ -1221,14 +1238,14 @@ class Merger:
     def _push_comment(self, plain: str, coloured_text: str):
         self._push(plain, coloured_text)
 
-    # ── emit a CommentGroup ────────────────────────────────────────────────────
+    # -- emit a CommentGroup ----------------------------------------------------
 
     def _emit_group(self, group: Optional[CommentGroup],
                     indent: str, is_pre: bool = False):
         """
         Emit a comment group.
-          is_pre=True  → type 3 (anchored-below): blank above preserved
-          is_pre=False → type 2 (anchored-above) or type 4 (freestanding)
+          is_pre=True  -> type 3 (anchored-below): blank above preserved
+          is_pre=False -> type 2 (anchored-above) or type 4 (freestanding)
         """
         if group is None:
             return
@@ -1256,7 +1273,7 @@ class Merger:
             if group.blank_below:
                 self._push_blank()
 
-    # ── decision helpers ───────────────────────────────────────────────────────
+    # -- decision helpers -------------------------------------------------------
 
     def _in_eff_doc(self, sym: str) -> bool:
         return sym in self._eff_doc
@@ -1291,7 +1308,7 @@ class Merger:
         return _struct_node_key(node) in self.sup.struct_index
 
 
-    # ── tree walk ──────────────────────────────────────────────────────────────
+    # -- tree walk --------------------------------------------------------------
 
     def run(self) -> list[OutputLine]:
         hdr = f"{G.header} {self.root.prompt or 'Linux Kernel Configuration'}"
@@ -1332,7 +1349,7 @@ class Merger:
             if sym in self.sup.symbol_index:
                 self.warnings.append(
                     f"Conflict: {sym} in both doc and suppressed "
-                    f"— doc wins, removing from suppressed")
+                    f"- doc wins, removing from suppressed")
 
     def _is_struct_in_doc(self, node: KNode) -> bool:
         """True if this structural node is explicitly in the effective doc.
@@ -1398,7 +1415,7 @@ class Merger:
         # prefix + spaces equal to len(connector), so '#' aligns with body text.
         cmt_indent = _comment_indent(prefix, connector)
 
-        # ── structural nodes ───────────────────────────────────────────────────
+        # -- structural nodes ---------------------------------------------------
         if node.kind in ("menu", "choice", "if", "comment"):
             nid = id(node)
             suppressed = self._is_struct_suppressed(node)
@@ -1433,7 +1450,7 @@ class Merger:
             self._recurse(node, child_pfx)
             return
 
-        # ── config / menuconfig ────────────────────────────────────────────────
+        # -- config / menuconfig ------------------------------------------------
         sym = node.symbol()
         if sym in self._emitted:
             return
@@ -1442,7 +1459,7 @@ class Merger:
         # Blank before this node only when:
         #  1. its direct parent's header was suppressed (not emitted), AND
         #  2. we are seeing a NEW parent group (not a sibling of the previous node)
-        # In a normal tree render connectors make hierarchy clear — blanks are
+        # In a normal tree render connectors make hierarchy clear - blanks are
         # only needed when suppression has broken the visual parent-child chain.
         parent = node.parent
         parent_suppressed = (
@@ -1451,7 +1468,7 @@ class Merger:
             and id(parent) not in self._struct_header_emitted
         )
         new_parent_group = (parent is not self._prev_emitted_parent)
-        # len > 1 because sym was already added above — we want
+        # len > 1 because sym was already added above - we want
         # "something was emitted before this node", not "this node exists".
         if parent_suppressed and new_parent_group and len(self._emitted) > 1:
             self._push_blank()
@@ -1491,7 +1508,7 @@ class Merger:
             self._recurse(node, child_pfx)
 
 
-# ── Suppressed file update ────────────────────────────────────────────────────
+# -- Suppressed file update ----------------------------------------------------
 
 def prune_suppressed(
     sup:         DocFileParser,
@@ -1515,7 +1532,7 @@ def prune_suppressed(
     return notices, []
 
 
-# ── Emit Linux .config format ─────────────────────────────────────────────────
+# -- Emit Linux .config format -------------------------------------------------
 
 def emit_kconfig_format(output_lines: list[OutputLine],
                         knode_index: dict[str, KNode]):
@@ -1539,7 +1556,7 @@ def emit_kconfig_format(output_lines: list[OutputLine],
             print(f"{sym}={node.value}")
 
 
-# ── Write helpers ──────────────────────────────────────────────────────────────
+# -- Write helpers --------------------------------------------------------------
 
 def write_doc(path: Path, lines: list[OutputLine]):
     with path.open("w") as f:
@@ -1602,7 +1619,7 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
 
     Each suppressed entry is rendered at its CORRECT tree depth and with
     the correct prefix/connector (as it would appear in the doc file).
-    Non-suppressed parent nodes are not written — their depth is accumulated
+    Non-suppressed parent nodes are not written - their depth is accumulated
     silently so that children appear at the right indentation level.
 
     A blank line is inserted between consecutive entries whose direct Kconfig
@@ -1640,7 +1657,7 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
             is_struct = node.kind in ("menu", "choice", "if", "comment")
 
             # Blank when consecutive entries have DIFFERENT nearest absent
-            # ancestors — meaning they belong to different logical groups.
+            # ancestors - meaning they belong to different logical groups.
             # Entries that share the same absent ancestor (e.g. siblings
             # of a suppressed choice, or children of a choice that is
             # itself inside an absent menu) stay adjacent.
@@ -1657,7 +1674,7 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
                 for line in entry.pre_group.lines:
                     f.write(line + "\n")
 
-            # Node line — same format as doc, at correct depth
+            # Node line - same format as doc, at correct depth
             tc = f" {entry.trailing_comment}" if (entry and entry.trailing_comment) else ""
             if node.symbol():
                 glyph  = node.raw_glyph()
@@ -1677,7 +1694,7 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
                     f.write("\n")
 
 
-# ── Post-render depth / filter ─────────────────────────────────────────────────
+# -- Post-render depth / filter -------------------------------------------------
 
 def _filter_output(lines: list[OutputLine],
                    max_depth: Optional[int],
@@ -1697,7 +1714,7 @@ def _filter_output(lines: list[OutputLine],
     return result
 
 
-# ── Stats ──────────────────────────────────────────────────────────────────────
+# -- Stats ----------------------------------------------------------------------
 
 def collect_stats(node: KNode, stats: dict):
     if node.kind in ("config", "menuconfig"):
@@ -1712,7 +1729,7 @@ def collect_stats(node: KNode, stats: dict):
         collect_stats(c, stats)
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# -- CLI ------------------------------------------------------------------------
 
 DEFAULT_DOC = "kconfig_doc.txt"
 DEFAULT_SUP = "kconfig_doc_suppressed.txt"
@@ -1743,6 +1760,8 @@ def main():
     ap.add_argument("--depth",           type=int, default=None)
     ap.add_argument("--filter",          default=None)
     ap.add_argument("--no-color",        action="store_true")
+    ap.add_argument("--ascii",           action="store_true",
+                    help="ASCII-only output: no UTF-8 box/glyph chars")
     ap.add_argument("--no-doc",          action="store_true")
     args = ap.parse_args()
 
@@ -1773,21 +1792,21 @@ def main():
         sys.exit(f"ERROR: Kconfig file not found: {kconfig_path}\n"
                  "Run from your kernel source root directory.")
 
-    print("Parsing Kconfig hierarchy …", file=sys.stderr)
+    print("Parsing Kconfig hierarchy ...", file=sys.stderr)
     parser = KconfigParser(arch=args.arch, kernel_root=kernel_root)
     root   = parser.parse(kconfig_path)
 
-    print(f"Loading {dotconfig_path} …", file=sys.stderr)
+    print(f"Loading {dotconfig_path} ...", file=sys.stderr)
     cfg = load_dotconfig(dotconfig_path)
     annotate_tree(root, cfg, col=0)
 
     num_cols = 1
     if dotconfig2_path.exists():
-        print(f"Loading {dotconfig2_path} …", file=sys.stderr)
+        print(f"Loading {dotconfig2_path} ...", file=sys.stderr)
         annotate_tree(root, load_dotconfig(dotconfig2_path), col=1)
         num_cols = 2
     if dotconfig3_path.exists():
-        print(f"Loading {dotconfig3_path} …", file=sys.stderr)
+        print(f"Loading {dotconfig3_path} ...", file=sys.stderr)
         annotate_tree(root, load_dotconfig(dotconfig3_path), col=2)
         num_cols = 3
 
@@ -1798,11 +1817,11 @@ def main():
     struct_knode_index = build_struct_knode_index(root)
 
     if doc_path.exists():
-        print(f"Reading {doc_path} …", file=sys.stderr)
+        print(f"Reading {doc_path} ...", file=sys.stderr)
     doc = DocFileParser(doc_path, knode_index, struct_knode_index)
 
     if sup_path.exists():
-        print(f"Reading {sup_path} …", file=sys.stderr)
+        print(f"Reading {sup_path} ...", file=sys.stderr)
     sup = DocFileParser(sup_path, knode_index, struct_knode_index)
 
     combined_max: dict[str, int] = {}
@@ -1814,15 +1833,15 @@ def main():
         tree_n = if_occurrence_counts.get(expr, 0)
         if seen_max > tree_n:
             print(f"WARNING: [{expr} ({seen_max})] referenced but tree has "
-                  f"only {tree_n} occurrence(s) — may have shifted after kernel update",
+                  f"only {tree_n} occurrence(s) - may have shifted after kernel update",
                   file=sys.stderr)
         elif tree_n > seen_max and seen_max > 1:
             # Only notify when the user is already referencing numbered occurrences
             # (seen_max > 1) so they know there are more.  When seen_max == 1 the
-            # user only references the unnumbered first occurrence — that's normal
+            # user only references the unnumbered first occurrence - that's normal
             # and not worth reporting for every common 'if' expression.
             print(f"NOTICE: [{expr}] has {tree_n} occurrences in tree; "
-                  f"doc+suppressed reference up to [{expr} ({seen_max})] — "
+                  f"doc+suppressed reference up to [{expr} ({seen_max})] - "
                   f"[{expr} ({tree_n})] also exists",
                   file=sys.stderr)
 
@@ -1859,11 +1878,11 @@ def main():
 
     if not args.no_doc:
         write_doc(doc_path, output_lines)
-        print(f"Doc written → {doc_path}", file=sys.stderr)
+        print(f"Doc written -> {doc_path}", file=sys.stderr)
 
         write_suppressed(sup_path, sup, root, knode_index, args.full)
         cleared = args.full and not sup.symbol_index and not sup.struct_index
-        print(f"Suppressed {'cleared' if cleared else 'updated'} → {sup_path}",
+        print(f"Suppressed {'cleared' if cleared else 'updated'} -> {sup_path}",
               file=sys.stderr)
 
     if args.show:
