@@ -1213,6 +1213,27 @@ def _is_folded_if(child: KNode, parent_node: KNode) -> bool:
                for c in parent_node.children if c is not child)
 
 
+def _first_doc_descendant(node: KNode, eff_doc: dict) -> str:
+    """Return the first doc-tracked symbol in node's subtree (incl. folded
+    if-block siblings for menuconfig nodes), or '' if none found.
+    Used by conflict resolution to enforce the invariant that a suppressed
+    symbol must not have doc-tracked descendants.
+    """
+    sym = node.symbol()
+    if sym and sym in eff_doc:
+        return sym
+    for child in node.children:
+        found = _first_doc_descendant(child, eff_doc)
+        if found:
+            return found
+    if node.kind == "menuconfig":
+        for f in _folded_ifs(node):
+            found = _first_doc_descendant(f, eff_doc)
+            if found:
+                return found
+    return ""
+
+
 def _subtree_has_suppressed(node: KNode, symbol_index: dict) -> bool:
     """True if any config/menuconfig in node's subtree is in symbol_index."""
     sym = node.symbol()
@@ -1460,11 +1481,29 @@ class Merger:
     # _is_struct_in_doc removed: the comment exception is now handled
     # by _struct_has_desc_comment, which checks the actual comment content.
 
+    def _folded_if_owner(self, child: KNode, siblings: list) -> Optional[KNode]:
+        """Return the menuconfig that owns this folded-if, only if that
+        menuconfig is actually being emitted (in doc or via add_new etc.).
+        Returns None if the menuconfig is not being emitted, meaning the
+        if-block should remain visible rather than being folded away.
+        """
+        if not _is_folded_if(child, child.parent):
+            return None
+        sym = child.prompt[3:].strip()
+        mc  = next((c for c in siblings
+                    if c.kind == "menuconfig" and c.name == sym), None)
+        if mc is None:
+            return None
+        return mc if self._should_emit(mc) else None
+
     def _has_visible_children(self, node: KNode) -> bool:
         children = node.children
         for i, child in enumerate(children):
-            # Folded-if: handled by the owning menuconfig, skip here
-            if _is_folded_if(child, node):
+            # Only fold the if-block when its owning menuconfig is
+            # actually being emitted.  If not, treat it as a normal
+            # structural node so its children remain reachable.
+            if (_is_folded_if(child, node)
+                    and self._folded_if_owner(child, children) is not None):
                 continue
             if child.kind in ("config", "menuconfig"):
                 if self._should_emit(child):
@@ -1479,8 +1518,9 @@ class Merger:
         out = []
         children = node.children
         for i, child in enumerate(children):
-            # Folded-if: handled by the owning menuconfig, skip here
-            if _is_folded_if(child, node):
+            # Only fold when owning menuconfig is being emitted
+            if (_is_folded_if(child, node)
+                    and self._folded_if_owner(child, children) is not None):
                 # Warn if the user put a descriptive comment on this
                 # if-entry in the doc file - it will never be shown.
                 key = _struct_node_key(child)
@@ -2018,13 +2058,50 @@ def main():
 
     sup_notices, _ = prune_suppressed(sup, knode_index, args.full)
 
-    # Remove from suppressed any symbols now in doc (conflict resolution)
+    # Conflict resolution - two passes enforcing both invariants:
+    #
+    # Pass A: direct conflict - symbol in both doc and suppressed, doc wins.
+    #
+    # Pass B: descendant conflict - a suppressed symbol must not have any
+    #   doc-tracked descendants (direct children or folded if-block subtrees,
+    #   recursively).  Auto-remove from suppressed and warn: the user must
+    #   suppress all descendants before suppressing the parent.
+    #   This enforces: "a symbol's parent is not suppressable while any of
+    #   its children remain in doc."
     doc_syms = set(merger._eff_doc.keys())
+
+    # Pass A
     for sym in list(sup.symbol_index.keys()):
         if sym in doc_syms:
             del sup.symbol_index[sym]
     sup.ordered = [e for e in sup.ordered
                    if not e.symbol or e.symbol not in doc_syms]
+
+    # Pass B
+    for sym in list(sup.symbol_index.keys()):
+        node = knode_index.get(sym)
+        if node is None:
+            continue
+        doc_child = _first_doc_descendant(node, merger._eff_doc)
+        if doc_child:
+            del sup.symbol_index[sym]
+            sup.ordered = [e for e in sup.ordered
+                           if not e.symbol or e.symbol != sym]
+            merger.warnings.append(
+                f"Removed {sym} from suppressed: descendant {doc_child} "
+                f"is doc-tracked. Suppress all descendants first, "
+                f"then suppress {sym}")
+
+    # Post-run invariant check: any doc-tracked symbol not in output is a bug
+    emitted_syms = {ol.symbol for ol in output_lines if ol.symbol}
+    for sym in doc_syms:
+        if sym in emitted_syms or sym not in knode_index:
+            continue
+        if sup.symbol_index.get(sym):
+            continue  # legitimately suppressed after resolution
+        merger.warnings.append(
+            f"{sym} is doc-tracked but was not emitted "
+            f"(possible tree traversal bug -- please report)")
 
     show_lines = output_lines
     if args.show and (args.depth is not None or args.filter):
