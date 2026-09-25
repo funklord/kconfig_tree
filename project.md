@@ -187,6 +187,13 @@ follows:
 - `--dotconfig2` and `--dotconfig3` in revision 33;
 - `--ascii` in revision 35.
 
+## Checks
+
+`make check` runs the shared style gate over the tree and the gate's own
+suite; `make hooks` installs the commit-msg hook. `tool/` holds verbatim
+copies from `claude-guidelines`, kept in step by its `sync.py`: fix them
+there, not here.
+
 The tool is vendored by copy into the kernel trees that use it. Those
 copies are theirs; this repository is where the tool itself changes.
 
@@ -201,8 +208,6 @@ copies are theirs; this repository is where the tool itself changes.
   docstring insert one between two config nodes that share no non-root
   ancestor. The code is newer, but which behaviour is intended has not been
   settled.
-- **Indentation is four spaces**, against the tab rule. See
-  `code-style.md`.
 - **No tests.** Every behaviour above was established by running the tool
   on a real kernel tree, and no fixture checks any of it.
 - **No `--version`.** The copyright line is in the README only.

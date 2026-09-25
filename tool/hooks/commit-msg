@@ -1,0 +1,268 @@
+#!/bin/sh
+# Copied from ~/.claude/tool/commit-msg -- the source. Keep in sync;
+# fix drift the moment you notice it. Install with `make hooks`.
+# Commit message checks, following kernel practice.
+#
+# The copy that runs lives in .git/hooks, which is untracked; this one is in
+# the tree so it is reviewable, survives a clone, and can be diffed against
+# its siblings. `make hooks` installs it. Bypass with `git commit
+# --no-verify`, which is at least a decision rather than an accident.
+#
+# Two rules, and only two. An earlier version of this hook also rejected a
+# trailing period and any `word:` prefix, neither of which was ever asked
+# for, and rejected Signed-off-by, which is wanted -- it is the Developer
+# Certificate of Origin, and what a reviewer adds when taking responsibility
+# for a change.
+
+msg="$1"
+
+# `\b` on the phrase and not on the names, which is the difference between
+# the two kinds of term here. The names are matched as substrings on purpose
+# -- a vendor word at the end of a path under the tree is still an
+# attribution, which was measured rather than assumed. `generated with` is
+# not a name, it is English, and unanchored it matched inside `regenerated
+# with`, refusing a message describing a header emitted a second time. A
+# gate that refuses ordinary prose is one somebody works around.
+TOOLING='\bgenerated with|claude|anthropic|copilot|chatgpt|noreply@anthropic'
+
+# What the prose check reads, and it is deliberately not the whole file.
+#
+# Two things are removed, for two different reasons.
+#
+# First, everything git is going to throw away: comment lines, and the diff
+# below the scissors line that `git commit -v` appends. Checking those
+# refuses a commit over text that will never be in it, and the case is not
+# hypothetical -- a change to THIS FILE shows its own vendor list in the
+# diff, so the hook refused every commit that edited it. (A message kept
+# with --cleanup=verbatim would retain comment lines; that is the one shape
+# where this is more lenient than the stored message.) Leading blank lines go
+# the same way and for the same reason, and it is not cosmetic: cleanup
+# strips them, so dropping them here is what makes the first line of `body`
+# the subject, which is what the line numbering in check 3 assumes.
+#
+# Second, the names of the shared tooling tree. Without this no commit could
+# say where these files come from: this hook lives at
+# ~/.claude/tool/commit-msg, the style gate beside it, and the guidelines
+# under ~/.claude/guidelines/. Naming one read as a "tooling reference" --
+# the rule firing on the one use it was never meant to cover, where the
+# workaround is to describe a path instead of writing it, making the log
+# vaguer exactly where it is trying to be exact.
+#
+# What is spared is exactly four NAMES: the directory `.claude`, written
+# with its leading dot; the file `CLAUDE.md`; `claude-guidelines`, the
+# repository the guidelines live in; and `claude-<digits>`, the per-uid
+# session scratch directory under /tmp. None is a plausible spelling of
+# attribution -- nobody credits a tool as ".claude" or signs off as
+# "claude-1001" -- while all four are unavoidable when writing about these
+# files. The bare vendor word on its own is untouched and still refused.
+#
+# The fourth arrived on 2026-09-05, the same way the third did. A commit
+# recording which directory held eleven gigabytes of a full filesystem
+# could not name it, and the message had to say "a per-uid directory this
+# user cannot read" -- the vaguer log, in the entry whose whole subject
+# was which directory it was.
+#
+# It is spelled with digits rather than as a path so that it matches the
+# name wherever it is written, which is what the other three do. Digits
+# and not `[0-9a-f]` deliberately: the transient `claude-<hex>-cwd` files
+# beside those directories are harness droppings nobody needs to name in a
+# message, and widening the class to hex would forgive far more of the
+# alphabet than the one name being spared. A model identifier of the form
+# `claude-3` is forgiven as a side effect; that is subject matter rather
+# than attribution, which `CLAUDE.md` already permits, and it cannot reach
+# a trailer -- the attribution check below reads the RAW message, so no
+# addition here can let a signed-off-by through.
+#
+# The third arrived the way the first two did: a commit reconciling a
+# project style file against its source could not name the repository the
+# source is in, and the message had to say "the repository holding it"
+# instead. A rule that makes the log vaguer where it is trying to be exact
+# is the rule misfiring, not the message.
+#
+# Only those names are neutralised, never the token around them. Stripping
+# whole path-shaped tokens instead would forgive anything hidden inside one,
+# and a trailer naming a vendor as the last element of a path under the tree
+# then passed; that was measured, and is why this is narrow.
+#
+# The trailer check below is deliberately left reading the raw message: it
+# keys on the trailer NAME rather than on any vendor, so a generated-by
+# trailer with any path at all is still refused.
+# `claude-guidelines` is substituted before `.claude` so that the longer
+# name cannot be left half-scrubbed by the shorter one if either is edited
+# later. Neither matches the other today; the ordering is a guard, not a
+# fix.
+#
+# Two variables come out of this, and the difference matters. `body` is the
+# message as it will be stored, minus what git discards. `prose` is that with
+# the names above neutralised, which is what the vendor checks read -- and is
+# the wrong thing to measure a column count against, since every substitution
+# here makes the line longer than the one somebody wrote.
+body=$(sed -e '/^#.*>8/,$d' -e '/^#/d' -e '/[^[:space:]]/,$!d' "$msg")
+prose=$(printf '%s\n' "$body" \
+	| sed -E 's#claude-guidelines#tooling-guidelines#g; s#claude-([0-9]+)#tooling-\1#g; s#\.claude#.tooling#g; s#CLAUDE\.md#guidelines.md#g')
+
+# 1. No AI or tooling attribution. The single deviation from kernel practice,
+#    and it is absolute. Human co-authors and reviewers are fine; a generator
+#    is not an author and does not sign anything.
+if grep -qiE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]*:.*(claude|anthropic|copilot|chatgpt|gpt|gemini|llm|ai)\b' "$msg" \
+	|| grep -qiE '^[[:space:]]*(assisted-by|generated-by)[[:space:]]*:' "$msg"; then
+	echo "commit-msg: generator attribution trailer. A tool is not an author." >&2
+	grep -inE '^[[:space:]]*(assisted-by|generated-by|co-developed-by)[[:space:]]*:' "$msg" >&2
+	exit 1
+fi
+
+if printf '%s\n' "$prose" | grep -qiE "$TOOLING"; then
+	echo "commit-msg: tooling reference in the message." >&2
+	# Reported from the scrubbed text on purpose: the line is shown as the
+	# check read it, so what is left highlighted is the actual reason, not a
+	# path that was already forgiven.
+	printf '%s\n' "$prose" | grep -inE "$TOOLING" >&2
+	exit 1
+fi
+
+# Columns, which is not the same as bytes.
+#
+# `${#var}` counts BYTES in dash, which is what /bin/sh is here. That reads
+# the same as a column count for ASCII and stops being one the moment a
+# message uses an em dash or an ellipsis: a 75-column line carrying one `...`
+# measures 77 and was refused. Eight of hydra's commits were rejected that
+# way, every one of them exactly 75 columns and correct -- the limit exists so
+# prose fits a terminal, and a character three bytes wide still occupies one
+# column.
+#
+# Rewrapping prose to satisfy that would be the defect being propagated
+# rather than fixed, so the count is fixed instead. Stripping UTF-8
+# continuation bytes (0x80-0xBF) leaves one byte per character, which is the
+# character count without needing a locale to be set -- `wc -m` would answer
+# correctly only where the environment happens to say UTF-8, and a hook runs
+# in whatever environment git was invoked from.
+#
+# The byte length is kept as a cheap pre-filter: it is never smaller than the
+# column count, so a line within 75 bytes needs no further measuring, and only
+# a suspect line pays for a subprocess.
+columns() {
+	printf '%s' "$1" | LC_ALL=C tr -d '\200-\277' | wc -c
+}
+
+# 2. Subject at 75 columns, the kernel's limit, taken deliberately: it is what
+#    keeps `git log --oneline` and `git shortlog` readable at a terminal width.
+#
+#    **git's subject is not line 1 of the file, and reading it as though it
+#    were switched this hook off.** Cleanup discards comment lines and leading
+#    blank lines before anything else, so with a `commit.template` whose first
+#    line is a comment -- the ordinary shape -- or with nothing worse than a
+#    stray blank line at the top, line 1 is a line git is about to throw away.
+#    This read that line and exited 0 when it began with `#`, which took the
+#    length check here, the wrapped-subject check below it and the whole body
+#    check with it, silently and for every commit made under such a template.
+#    Measured on real commits rather than reasoned about: a 96-column subject
+#    was accepted. So take the first line that is neither a comment nor blank,
+#    which is the line git will call the subject.
+#
+#    A message holding nothing else is an aborted commit, which git refuses on
+#    its own account, so it still leaves quietly. That is what the `#` case was
+#    reaching for and is the only part of it worth keeping.
+subject=$(awk '/^#/ { next } /^[[:space:]]*$/ { next } { print; exit }' "$msg")
+[ -n "$subject" ] || exit 0
+if [ "${#subject}" -gt 75 ] && [ "$(columns "$subject")" -gt 75 ]; then
+	echo "commit-msg: subject is $(columns "$subject") columns, limit is 75." >&2
+	echo "commit-msg:   $subject" >&2
+	exit 1
+fi
+
+#    And the subject must be ONE line, which is the part the limit above
+#    cannot see. git's subject is everything up to the first blank line,
+#    joined with spaces -- so a subject wrapped onto a second short line
+#    passes every per-line check here and is over-long by the time anything
+#    reads it. Measured in fuzznet by writing one: `git log --oneline`
+#    printed 93 columns for the commit that found it, and a deliberate case
+#    joined to 123. The check above measures a physical line; this measures
+#    what git will call the subject, which is the thing the limit is for.
+#
+#    Comment lines are skipped rather than counted, because git strips them
+#    before deciding anything, so one on line 2 never joins the subject. A
+#    blank line met before the subject has begun is skipped for the same
+#    reason and must be: cleanup removes it too, and ending the join there
+#    while the subject itself starts below it made every message with a blank
+#    line at the top read as a subject wrapped onto two.
+joined=$(awk '/^#/ { next } \
+              n == 0 && /^[[:space:]]*$/ { next } \
+              /^[[:space:]]*$/ { exit } \
+              { if (n++) printf " "; printf "%s", $0 } END { printf "\n" }' "$msg")
+if [ "$joined" != "$subject" ]; then
+	echo "commit-msg: the subject is wrapped onto more than one line." >&2
+	echo "commit-msg: git joins everything before the first blank line into" >&2
+	echo "commit-msg: one subject, giving $(columns "$joined") columns:" >&2
+	echo "commit-msg:   $joined" >&2
+	echo "commit-msg: put a blank line after the subject." >&2
+	exit 1
+fi
+
+# 3. Body lines at the same 75 columns, for the same reason: the log is read in
+#    a terminal. This was the stated convention long before anything enforced
+#    it, and only the subject was checked -- so a body line at 76 sailed
+#    through while a subject at 76 was refused.
+#
+# Measured in columns by `columns()` above, exactly as the subject is, so the
+# two checks cannot disagree about what a column is.
+#
+# **Three kinds of line are exempt, and each is a rule rather than a
+# concession.**
+#
+#   - A trailer. `Never wrap a trailer, whatever its length`: git parses the
+#     block one line at a time, so a `Link:` broken in two stops being a
+#     trailer at all and every tool that reads them silently misses it. Kernel
+#     `Link:` lines routinely run well past 75 and are left alone.
+#   - A line holding a url. A wrapped link is not clickable, often cannot be
+#     reassembled, and leaves the reader guessing whether the trailing
+#     punctuation belongs to it. The limit exists so prose stays readable, and
+#     a url is not prose.
+#   - An indented line, which is how a message carries something it is
+#     quoting -- a compiler error, a stack trace, a snippet of output.
+#     Reflowing quoted material to fit corrupts it.
+#
+# A trailer is recognised by its name rather than by a list, so one that has
+# not come up yet is exempt on the same terms as `Fixes:` and `Link:`.
+#
+# **The blind spot is named rather than pretended away.** A line of prose
+# opening `Note:` is indistinguishable from a trailer to any rule keyed on the
+# name, and the guidelines settle what a trailer is by asking whether it names
+# a person or an artifact -- which this cannot know. So it forgives that line.
+# That is the right direction to be wrong in: the cost of forgiving one long
+# prose line is a long prose line, while the cost of refusing a legitimate
+# `Link:` is somebody wrapping it, at which point git stops parsing it as a
+# trailer and every tool that reads them misses it silently.
+long=""
+n=0
+while IFS= read -r line; do
+	n=$((n + 1))
+	[ "$n" -eq 1 ] && continue		# the subject, checked above
+	[ "${#line}" -gt 75 ] || continue	# bytes: an upper bound on columns
+	case "$line" in
+		' '*|'	'*) continue ;;		# quoted, not prose
+		*://*) continue ;;		# carries a url
+	esac
+	head=${line%%:*}
+	if [ "$head" != "$line" ]; then
+		case "$head" in
+			'' | *[!A-Za-z-]*) ;;	# not a trailer name
+			*) continue ;;		# `Fixes:`, `Link:`, `Signed-off-by:` ...
+		esac
+	fi
+	width=$(columns "$line")
+	[ "$width" -gt 75 ] || continue
+	long="$long
+commit-msg:   $n: $width columns: $line"
+done <<EOF
+$body
+EOF
+
+if [ -n "$long" ]; then
+	echo "commit-msg: body line(s) past 75 columns." >&2
+	printf '%s\n' "$long" | sed '/^$/d' >&2
+	echo "commit-msg: wrap prose at 75. Trailers, urls and indented" >&2
+	echo "commit-msg: (quoted) lines are exempt and need no wrapping." >&2
+	exit 1
+fi
+
+exit 0

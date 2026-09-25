@@ -1,0 +1,10 @@
+# Configuration for tool/style_gate.py -- see code-style.md.
+
+# A Makefile has neither a suffix nor a shebang, so without this line it is
+# not checked at all. Naming it applies the tab rule too, which is right
+# while the Makefile has no `ifeq` (whose body must be space-indented).
+indent_names = ["Makefile"]
+
+# ASCII outside string literals. The glyphs the tool draws live in string
+# literals, which the check allows; measured clean on 2026-09-25.
+ascii_only = true
