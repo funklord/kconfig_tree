@@ -407,12 +407,12 @@ here for the detail. It does not restate the precedence rule.
 
 **Exempt paths:** none. The tree is one Python program and its documents.
 
-**kconfig_tree.py does not follow rule 2 yet.** It is indented with four
-spaces throughout -- 1670 lines, 0 tab-indented, measured 2026-09-25 --
-because it was written before it became a project here. Converting it is a
-mechanical retab and carries the proof `evidence.md` asks for: `ast.dump()`
-of the file before and after must be identical. Until that is done, do not
-mix tabs into it piecemeal; a file with both is worse than either.
+**kconfig_tree.py was retabbed on 2026-09-25**, from four spaces to tabs,
+by `style_gate.py fix`. Proved outside the fixer as well: `ast.dump()` is
+identical before and after, and expanding each leading tab back to four
+spaces reproduces the original file byte for byte. The lines still led by
+spaces are continuation alignment and docstring text, which is the rule
+working rather than an exception to it.
 
 **ASCII in source holds already.** Measured with `tokenize` on 2026-09-25:
 no non-ASCII character outside a string literal. The box-drawing and glyph
