@@ -31,5 +31,20 @@ class HelpTest(unittest.TestCase):
 		self.assertEqual(missing, [])
 
 
+class VersionTest(unittest.TestCase):
+	# The number lives in the VERSION file and, because the script travels
+	# alone into the trees that vendor it, again in the script. Asked of
+	# the running program rather than grepped from the source, so a copy
+	# that parses but prints the wrong thing fails too.
+	def test_version_matches_the_version_file(self) -> None:
+		result = subprocess.run([sys.executable, str(TOOL), "--version"],
+		                        capture_output=True, text=True, timeout=60)
+		self.assertEqual(result.returncode, 0, result.stderr)
+		want = (TOOL.parent / "VERSION").read_text(encoding="utf-8").strip()
+		first, _, rest = result.stdout.partition("\n")
+		self.assertEqual(first, f"kconfig_tree {want}")
+		self.assertIn("Copyright (C) 2026 Nabeel Sowan", rest)
+
+
 if __name__ == "__main__":
 	unittest.main()

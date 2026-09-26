@@ -83,6 +83,7 @@ OPTIONS
   --no-color          Disable ANSI colours
   --ascii             ASCII-only output: no UTF-8 box/glyph chars
   --no-doc            Do not write any files this run
+  --version           Print the version and copyright, then exit
 """
 
 import argparse
@@ -1937,6 +1938,12 @@ def collect_stats(node: KNode, stats: dict):
 
 # -- CLI ------------------------------------------------------------------------
 
+# This program's version. Duplicated from the VERSION file at the root,
+# because the script is vendored into kernel trees on its own and has no
+# VERSION file to read there; test_kconfig_tree.py holds the two in step.
+KCONFIG_TREE_VERSION = "1.0"
+COPYRIGHT = "Copyright (C) 2026 Nabeel Sowan <nabeel@vibes.se>"
+
 DEFAULT_DOC = "kconfig_doc.txt"
 DEFAULT_SUP = "kconfig_doc_suppressed.txt"
 
@@ -1969,6 +1976,8 @@ def main():
 	ap.add_argument("--ascii",           action="store_true",
                     help="ASCII-only output: no UTF-8 box/glyph chars")
 	ap.add_argument("--no-doc",          action="store_true")
+	ap.add_argument("--version",         action="version",
+	                version=f"kconfig_tree {KCONFIG_TREE_VERSION}\n{COPYRIGHT}")
 	args = ap.parse_args()
 
 	if args.no_color or args.emit_kconfig:

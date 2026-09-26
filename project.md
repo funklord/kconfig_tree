@@ -73,6 +73,13 @@ in each file:
     --no-color           no ANSI colours
     --ascii              ASCII-only output, no UTF-8 box or glyph characters
     --no-doc             write no files this run
+    --version            print the version and copyright, then exit
+
+The version is in `VERSION` and again in the script as
+`KCONFIG_TREE_VERSION`, because the script is vendored into kernel trees on
+its own and has no `VERSION` file to read there. `test_kconfig_tree.py`
+fails if the two disagree. `--version` prints `kconfig_tree <version>` on
+the first line, for scripts to read, and the copyright on the next.
 
 The number of config columns is decided at startup by which of `.config`,
 `.config2` and `.config3` exist. The glyphs widen to match: `[*]` for one
@@ -206,6 +213,6 @@ copies are theirs; this repository is where the tool itself changes.
   ancestor. The code is newer, but which behaviour is intended has not been
   settled.
 - **Almost no tests.** `test_kconfig_tree.py` checks only that `--help`
-  lists every option. Every other behaviour above was established by
-  running the tool on a real kernel tree, and no fixture checks any of it.
-- **No `--version`.** The copyright line is in the README only.
+  lists every option and that `--version` agrees with `VERSION`. Every
+  other behaviour above was established by running the tool on a real
+  kernel tree, and no fixture checks any of it.
