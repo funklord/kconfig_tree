@@ -613,10 +613,32 @@ def build_struct_knode_index(
 _DOC_SYMBOL_RE   = re.compile(r"\((\w+)\)\s*(?:->|→)?\s*(?:#.*)?$")
 _SYMBOL_TAG_RE   = re.compile(r"\((\w+)\)")  # tag only, no trailing
 _TRAILING_CMT_RE = re.compile(r" (#.*)$")
+_GLYPH_RE        = re.compile(r"^\[([^\]]*)\]")
+
+
+def _glyph_file_value(content: str) -> str:
+	"""The .config value a tree line's glyph records, or "" if none.
+
+    Column 1 is always the primary .config. A bool glyph keeps one
+    character per column, so its first character is column 1. A value
+    glyph lists its distinct values in column order, so the first is
+    column 1's whenever column 1 has one; when it has none, the first
+    belongs to a later column, and the mismatch check skips an unset
+    .config value anyway.
+    """
+	m = _GLYPH_RE.match(content)
+	if not m:
+		return ""
+	inner = m.group(1)
+	if inner.startswith("="):
+		return inner[1:].split("/")[0]
+	return {"*": "y", "M": "m", "m": "m"}.get(inner[:1], "")
 _BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
 _BARE_SYM_RE     = re.compile(r"^\w+$")  # single bare identifier
 _DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
 _DOTCFG_UNSET_RE = re.compile(r"^#\s+(CONFIG_\w+)\s+is not set\s*$")
+# The stub write_suppressed leaves for a vanished symbol that had a comment.
+_DEAD_STUB_RE    = re.compile(r"^# (CONFIG_\w+)(?: (#.*))?$")
 def _build_struct_leader() -> re.Pattern:
 	m  = re.escape(G.menu)
 	c  = re.escape(G.choice)
@@ -651,6 +673,7 @@ class RawEntry:
 	pre_group:  Optional[CommentGroup] = None  # type-3
 	post_groups: list[CommentGroup] = field(default_factory=list)  # type-2 and/or type-4
 	anchor_above_sym: str = ""  # for dead entries: last known symbol above in doc
+	from_stub: bool = False     # read back from a stub; already converted
 
 
 def _extract_trailing(content: str) -> tuple[str, str]:
@@ -773,6 +796,20 @@ class DocFileParser:
 
 			_prefix, content = _strip_tree_prefix(line)
 
+			# In the suppressed file a stub is read back as the entry it
+			# stands for. Read as a plain comment it would attach to nothing
+			# when it is the file's only content, and be lost on the next
+			# write; read as an entry, it is a stub again while the symbol
+			# stays out of the tree, and a suppressed option once it returns.
+			# Not in doc, where "# CONFIG_FOO" may be a note.
+			m = _DEAD_STUB_RE.match(content) if self.is_suppressed else None
+			if m:
+				items.append(("option",
+                              RawEntry(symbol=m.group(1),
+                                       trailing_comment=m.group(2) or "",
+                                       file_value="", from_stub=True)))
+				continue
+
 			if content.startswith("#"):
 				items.append(("comment", content))
 				continue
@@ -815,7 +852,8 @@ class DocFileParser:
 				items.append(("option",
                               RawEntry(symbol=f"CONFIG_{ms.group(1)}",
                                        trailing_comment=trailing,
-                                       file_value="")))
+                                       file_value=_glyph_file_value(
+                                               content_clean))))
 				continue
 
 			prompt_key = _struct_prompt_key(content_clean)
@@ -1029,10 +1067,13 @@ class DocFileParser:
 				self.struct_index[key] = entry
 				self.ordered.append(entry)
 			# Track highest occurrence number seen for change detection.
-			# Only for genuine 'if' node keys - exclude two-level keys such as
-			# "if EXPR::Child prompt" where the parent happens to be an if-block.
-			if key.startswith("if ") and "::" not in key:
-				base_expr, n = _parse_if_occurrence(key)
+			# Read from the line itself, not the key: an occurrence the tree
+			# no longer has resolves to nothing and is keyed "Menu::if EXPR
+			# (N)", which is the very case the warning exists for. `own` is
+			# this line's prompt, so a child keyed "if EXPR::Child" under an
+			# if-block does not match.
+			if own.startswith("if "):
+				base_expr, n = _parse_if_occurrence(own)
 				self.max_if_occurrences[base_expr] = max(
                     self.max_if_occurrences.get(base_expr, 0), n)
 			depth_stack.append((d, own))
@@ -1060,6 +1101,7 @@ class DocFileParser:
                                 or entry.trailing_comment)
 			if has_comments:
 				self.dead_entries.append(entry)
+			if has_comments and not entry.from_stub:
 				self.warnings.append(
                     f"Symbol {sym} in {self.path.name} not found in "
                     f"Kconfig tree - converted to inline comment")
@@ -1440,7 +1482,34 @@ class Merger:
 		for dead_entry in self._rootless_dead:
 			self._emit_dead_comment(dead_entry, prefix="", connector="")
 		self._recurse(self.root, prefix="")
+		self._notice_untracked(self.root, set())
 		return self.output
+
+	def _notice_untracked(self, node: KNode, seen: set):
+		"""Notice every active option neither file tracks, in tree order.
+
+		A separate pass over the whole tree, not part of the walk: the walk
+		does not enter a menu with nothing visible, and a menu a kernel
+		update adds is exactly that. With --add-new, --add-new-enabled or
+		--full the walk adds such options instead, so nothing is noticed.
+		"""
+		if self.add_new or self.add_new_en or self.full:
+			return
+		for child in node.children:
+			sym = child.symbol()
+			if (child.kind in ("config", "menuconfig") and sym
+                    and sym not in seen
+                    and child.any_col_active()
+                    and not self._in_eff_doc(sym)
+                    and not self._in_sup(sym)
+                    and (child.kind != "menuconfig" or not any(
+                            self._in_eff_doc(c.symbol())
+                            for c in child.children if c.symbol()))):
+				seen.add(sym)
+				self.notices.append(
+                    f"Active option not tracked: {sym} "
+                    f"(use --add-new-enabled or --add-new)")
+			self._notice_untracked(child, seen)
 
 	def _emit_dead_comment(self, entry: RawEntry,
                            prefix: str, connector: str):
@@ -1534,20 +1603,6 @@ class Merger:
 			if child.kind in ("config", "menuconfig"):
 				if self._should_emit(child):
 					out.append(child)
-				else:
-					sym = child.symbol()
-					if (child.any_col_active()
-                            and not self._in_eff_doc(sym)
-                            and not self._in_sup(sym)
-                            and not self.add_new
-                            and not self.add_new_en
-                            and not self.full):
-						if child.kind != "menuconfig" or not any(
-                                self._in_eff_doc(c.symbol())
-                                for c in child.children if c.symbol()):
-							self.notices.append(
-                                f"Active option not tracked: {sym} "
-                                f"(use --add-new-enabled or --add-new)")
 			elif child.kind in ("menu", "choice", "if", "comment"):
 				# Visible when: has visible children OR has a descriptive
 				# comment (the comment exception keeps annotated nodes
@@ -1817,7 +1872,10 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
     parent was NOT itself emitted in the suppressed file (i.e. the parent is
     absent, so the hierarchy break needs visual marking).
     """
-	if not sup.symbol_index and not sup.struct_index:
+	# Vanished symbols that carried a comment. With --full they have
+	# moved into doc with the rest of suppressed, so they are not kept here.
+	dead = [] if full else list(sup.dead_entries)
+	if not sup.symbol_index and not sup.struct_index and not dead:
 		path.write_text("")
 		return
 
@@ -1842,9 +1900,32 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
 			p = p.parent
 		return None  # parent chain is all-present or at root
 
+	# Each stub goes under the suppressed option it followed, as in doc;
+	# one whose anchor is not written goes at the top.
+	written_syms = {node.symbol() for node, *_ in ordered if node.symbol()}
+	dead_by_anchor: dict[str, list[RawEntry]] = {}
+	dead_rootless: list[RawEntry] = []
+	for d in dead:
+		if d.anchor_above_sym in written_syms:
+			dead_by_anchor.setdefault(d.anchor_above_sym, []).append(d)
+		else:
+			dead_rootless.append(d)
+
+	def _write_dead(f, d: RawEntry, indent: str):
+		for line in (d.pre_group.lines if d.pre_group else []):
+			f.write(f"{indent}{line}\n")
+		tc = f" {d.trailing_comment}" if d.trailing_comment else ""
+		f.write(f"{indent}# {d.symbol}{tc}\n")
+		for g in d.post_groups:
+			for line in g.lines:
+				f.write(f"{indent}{line}\n")
+
 	with path.open("w") as f:
 		first                    = True
 		prev_absent_ancestor: Optional[KNode] = None
+		for d in dead_rootless:
+			_write_dead(f, d, "")
+			first = False
 		for node, entry, prefix, connector in ordered:
 			is_struct = node.kind in ("menu", "choice", "if", "comment")
 
@@ -1884,6 +1965,9 @@ def write_suppressed(path: Path, sup: "DocFileParser", root: KNode,
 					f.write(line + "\n")
 				if pg.blank_below:
 					f.write("\n")
+
+			for d in dead_by_anchor.get(node.symbol(), []):
+				_write_dead(f, d, "")
 
 
 # -- Post-render depth / filter -------------------------------------------------

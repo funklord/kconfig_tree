@@ -204,15 +204,33 @@ class ValueTest(unittest.TestCase):
 		self.assertIn("[=8192] Alpha three (A3)", tree.read("kconfig_doc.txt"))
 
 	# The merge rule is "emit, update glyph, warn on value mismatch". The
-	# check reads only values given in .config form (CONFIG_A3=4096); a
-	# doc in the tool's own tree form never carries one, so the glyph is
-	# updated in silence.
-	@unittest.expectedFailure
+	# check once read only values in .config form (CONFIG_A3=4096), so a
+	# doc in the tool's own tree form had its glyphs updated in silence.
+	# The glyph now carries the value the check compares.
 	def test_value_change_in_tree_form_warns(self) -> None:
 		tree = KernelTree(self)
 		tree.run("--add-new-enabled")
-		tree.write(".config", TREE_CONFIG.replace("=4096", "=8192"))
-		self.assertIn("A3", output(tree.run()))
+		tree.write(".config", TREE_CONFIG.replace("=4096", "=8192")
+		                                 .replace("CONFIG_A2=m", "CONFIG_A2=y"))
+		result = output(tree.run())
+		self.assertIn("Value mismatch for CONFIG_A3: file has =4096, "
+		              ".config has =8192", result)
+		self.assertIn("Value mismatch for CONFIG_A2: file has =m", result)
+		# Warned once: the rewritten glyph now agrees.
+		self.assertNotIn("Value mismatch", output(tree.run()))
+
+	# A two-column value glyph lists distinct values in column order, so
+	# .config's is the first: read as such it warns on a change there and
+	# on nothing else.
+	def test_two_column_value_glyph_reads_the_first_column(self) -> None:
+		tree = KernelTree(self)
+		tree.write(".config2", "CONFIG_A3=8192\n")
+		tree.write("kconfig_doc.txt", "CONFIG_A3\n")
+		tree.run()
+		self.assertIn("[=4096/8192]", tree.read("kconfig_doc.txt"))
+		self.assertNotIn("Value mismatch", output(tree.run()))
+		tree.write(".config", TREE_CONFIG.replace("=4096", "=2048"))
+		self.assertIn("file has =4096, .config has =2048", output(tree.run()))
 
 	def test_value_change_in_dotconfig_form_warns(self) -> None:
 		tree = KernelTree(self)
@@ -238,14 +256,27 @@ class TrackingTest(unittest.TestCase):
 		              output(tree.run("--no-doc")))
 
 	# The same rule for an option whose menu shows nothing yet -- the shape
-	# a kernel update takes when it adds a menu. The walk never enters a
-	# menu with no visible children, so the notice is never raised.
-	@unittest.expectedFailure
+	# a kernel update takes when it adds a menu. The notice was raised
+	# during the walk, which never enters such a menu; it is now a pass of
+	# its own over the whole tree.
 	def test_untracked_option_in_an_undocumented_menu_gets_a_notice(
 	        self) -> None:
 		tree = KernelTree(self)
 		tree.write("kconfig_doc.txt", "CONFIG_A1\n")
-		self.assertIn("CONFIG_B1", output(tree.run("--no-doc")))
+		result = output(tree.run("--no-doc"))
+		self.assertIn("Active option not tracked: CONFIG_B1", result)
+		self.assertEqual(result.count("not tracked: CONFIG_A2 "), 1)
+
+	# With --add-new or --add-new-enabled the option is added instead of
+	# noticed, in an undocumented menu as anywhere else.
+	def test_add_flags_add_instead_of_noticing(self) -> None:
+		for flag in ("--add-new", "--add-new-enabled"):
+			with self.subTest(flag=flag):
+				tree = KernelTree(self)
+				tree.write("kconfig_doc.txt", "CONFIG_A1\n")
+				result = output(tree.run(flag))
+				self.assertIn("(B1)", tree.read("kconfig_doc.txt"))
+				self.assertNotIn("not tracked", result)
 
 	def test_add_new_enabled_reads_the_named_column(self) -> None:
 		tree = KernelTree(self)
@@ -313,20 +344,43 @@ class VanishedSymbolTest(unittest.TestCase):
 		self.assertNotIn("A3", tree.read("kconfig_doc.txt"))
 		self.assertNotIn("A3", output(result))
 
-	# The warning says the entry was "converted to inline comment", but the
-	# suppressed file is written without dead entries, so the rationale is
-	# gone from both files.
-	@unittest.expectedFailure
+	# The suppressed file used to be written without dead entries, so the
+	# rationale vanished from both files under a warning that said it had
+	# been converted. The stub must also survive the next read -- as the
+	# file's only content, a plain comment attaches to nothing -- and turn
+	# back into a suppressed option when the symbol returns.
 	def test_commented_suppressed_symbol_keeps_its_comment(self) -> None:
 		tree = KernelTree(self)
 		tree.write("kconfig_doc.txt", "CONFIG_A1\n")
 		tree.write("kconfig_doc_suppressed.txt",
 		           "CONFIG_A4 # rejected: breaks the thing\n")
+		kconfig = tree.read("Kconfig")
+		tree.drop_config("A4")
+		first = output(tree.run())
+		self.assertIn("CONFIG_A4", first)
+		stub = tree.read("kconfig_doc_suppressed.txt")
+		self.assertEqual(stub, "# CONFIG_A4 # rejected: breaks the thing\n")
+		second = output(tree.run())
+		self.assertEqual(tree.read("kconfig_doc_suppressed.txt"), stub)
+		self.assertNotIn("CONFIG_A4", second)
+		tree.write("Kconfig", kconfig)
+		tree.run()
+		self.assertIn("(A4) # rejected: breaks the thing",
+		              tree.read("kconfig_doc_suppressed.txt"))
+
+	def test_suppressed_stub_stays_under_its_anchor(self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_A1\n")
+		tree.write("kconfig_doc_suppressed.txt",
+		           "CONFIG_A2 # two why\nCONFIG_A4 # rejected\n")
 		tree.drop_config("A4")
 		tree.run()
-		kept = (tree.read("kconfig_doc.txt")
-		        + tree.read("kconfig_doc_suppressed.txt"))
-		self.assertIn("rejected: breaks the thing", kept)
+		lines = tree.read("kconfig_doc_suppressed.txt").splitlines()
+		self.assertIn("(A2) # two why", lines[-2])
+		self.assertEqual(lines[-1], "# CONFIG_A4 # rejected")
+		tree.run()
+		self.assertEqual(tree.read("kconfig_doc_suppressed.txt").splitlines(),
+		                 lines)
 
 
 class IfOccurrenceTest(unittest.TestCase):
@@ -363,10 +417,9 @@ endmenu
 		              output(tree.run("--no-doc")))
 
 	# Inside a menu, an occurrence the tree lacks gets a two-level key
-	# ("Menu::if BAR (5)"), and occurrence tracking skips any key with
-	# "::" in it -- so the warning cannot fire where kernel if-blocks
-	# nearly always are.
-	@unittest.expectedFailure
+	# ("Menu::if BAR (5)"), and occurrence tracking used to skip any key
+	# with "::" in it -- so the warning could not fire where kernel
+	# if-blocks nearly always are. It now reads the line, not the key.
 	def test_missing_occurrence_warns_inside_a_menu(self) -> None:
 		tree = self.tree()
 		tree.write("kconfig_doc.txt",

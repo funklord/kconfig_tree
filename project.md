@@ -56,7 +56,12 @@ carried a comment:
   (Pass 4 in `DocFileParser`): nothing was written about it, so nothing is
   kept. `prune_suppressed` also has a notice for this, but Pass 4 has
   already removed the symbol by the time it runs, so it never prints.
-- **With a comment, in suppressed**, it is lost. See *Open*.
+- **With a comment, in suppressed**, it becomes a `# CONFIG_SYMBOL #
+  comment` stub under the suppressed option it followed, or at the top.
+  The parser reads such a line back as the entry it stands for, in the
+  suppressed file only. So the stub survives even as the file's only
+  content, and when the symbol returns it is a suppressed option again,
+  with its comment. The warning is printed once, when the stub is made.
 
 ## Command line
 
@@ -78,6 +83,13 @@ carried a comment:
     --ascii              ASCII-only output, no UTF-8 box or glyph characters
     --no-doc             write no files this run
     --version            print the version and copyright, then exit
+
+A notice names every active option that neither file tracks, anywhere
+in the tree, including a menu with nothing documented yet. It is not
+given with `--add-new`, `--add-new-enabled` or `--full`, which add such
+options instead. A value in a tree line's glyph (`[*]`, `[M]`,
+`[=4096]`) that differs from `.config` gets a "Value mismatch" warning
+once. The glyph is then rewritten, so the next run agrees.
 
 The version is in `VERSION` and again in the script as
 `KCONFIG_TREE_VERSION`, because the script is vendored into kernel trees on
@@ -232,30 +244,12 @@ copies are theirs; this repository is where the tool itself changes.
 
 ## Open
 
-Four defects, each pinned by an `expectedFailure` test in
-`test_kconfig_tree.py`. Such a test reports an unexpected success when its
-defect is fixed, and then has its decorator removed.
-
-- **No notice for an active option under a menu with nothing documented
-  yet.** The walk never enters a menu with no visible children, so the
-  "Active option not tracked" notice is raised only for options whose
-  menu already shows something. A kernel update that adds a menu with
-  options on by default says nothing about them.
-- **No warning when a value changes in the tool's own tree format.** The
-  merge rule says to warn on a value mismatch. The check reads only values
-  written in `.config` form (`CONFIG_A3=4096`), so after `[=4096]` becomes
-  `[=8192]` the glyph is updated without a warning.
-- **A vanished suppressed option loses its comment.** Its warning says it
-  was "converted to inline comment", but `write_suppressed` never writes
-  dead entries, so the rationale disappears from both files.
-- **The missing-occurrence warning cannot fire inside a menu.** An
-  `[if EXPR (N)]` the tree no longer has gets a two-level key
-  (`Menu::if EXPR (N)`), and occurrence tracking skips keys containing
-  `::`. It works only for `if` blocks at the top of the tree.
-
-The suite covers the behaviour documented above: comments, ordering,
-values, `--emit-kconfig`, notices, config columns, `--ascii`, suppression,
-conflicts, vanished symbols and `if` numbering. Every passing test has
-been seen to fail: eight single-line mutations of the tool each turned the
-intended test red. The folding of `[if SYM]` under its menuconfig and
-`--full` are not covered yet.
+- **Tests do not cover** the folding of `[if SYM]` under its menuconfig,
+  or `--full`. Everything else documented above has a test in
+  `test_kconfig_tree.py`, and every passing test has been seen to fail
+  under a one-line mutation of the tool.
+- **A value change to or from unset is not warned about.** The mismatch
+  check skips a value that is empty or `n` on either side, so a
+  documented `[*]` option that a kernel update turns off only has its
+  glyph changed. That was the rule before the value fix, and it is kept
+  until somebody decides otherwise.
