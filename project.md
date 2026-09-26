@@ -47,12 +47,16 @@ Merge rules at tree-walk time:
 | `--add-new-enabled [N]` | Add untracked symbols active in config column N (1-3) |
 | `--full` | Merge suppressed into doc, then add everything remaining |
 
-A symbol that no longer exists in the Kconfig tree is handled differently
-in each file:
+A symbol that no longer exists in the Kconfig tree is kept only if it
+carried a comment:
 
-- **In doc**, it is kept as a `# CONFIG_SYMBOL` stub at its old position if
-  it had a comment attached, so the rationale is not lost.
-- **In suppressed**, it is dropped, with a notice.
+- **With a comment, in doc**, it becomes a `# CONFIG_SYMBOL` stub at its
+  old position, with a warning, so the rationale is not lost.
+- **Without a comment**, in either file, it is dropped silently, by design
+  (Pass 4 in `DocFileParser`): nothing was written about it, so nothing is
+  kept. `prune_suppressed` also has a notice for this, but Pass 4 has
+  already removed the symbol by the time it runs, so it never prints.
+- **With a comment, in suppressed**, it is lost. See *Open*.
 
 ## Command line
 
@@ -105,8 +109,10 @@ differ. The file format is the same however many columns there are.
 - **`Merger`** walks the Kconfig tree against the effective doc and
   suppressed indexes and produces a list of `OutputLine` objects.
 - **`write_doc` / `write_suppressed`** write both files back in Kconfig
-  tree order. In the suppressed file each entry sits at its true depth, and
-  parents that are not suppressed are left out and not written.
+  tree order. In the suppressed file each entry sits at its true depth.
+  Since revision 36, `write_suppressed` also writes the menu, choice and
+  `if` headers above every group of suppressed options, as context.
+  Reading those headers back hides nothing (see invariant 2).
 
 ### Keys that survive a kernel update
 
@@ -155,14 +161,14 @@ moves it:
 ### Invariants
 
 1. Every `if` node's `occurrence_key` is globally unique.
-2. Suppression is per node, never hierarchical. Suppressing a menu header
-   hides that one line, and its children stay visible and tracked.
+2. Only options can be suppressed. Since revision 36, a menu, choice or
+   `if` header is shown whenever something under it is visible or it
+   carries a comment, and its line in the suppressed file has no effect.
 3. Comments always travel with their anchor.
 4. Multi-config is additive: a single-config run behaves exactly as it did
    before columns existed.
-5. The suppressed file is never filled in with structural context. Only
-   what the user put there is written. Parent menus added automatically
-   would be read back as suppressed.
+5. An option in both files is a conflict: doc wins, it is removed from
+   suppressed, and the warning names the conflict.
 
 ## Maintaining a configuration with it
 
@@ -226,7 +232,30 @@ copies are theirs; this repository is where the tool itself changes.
 
 ## Open
 
-- **Few tests.** `test_kconfig_tree.py` checks that `--help` lists every
-  option, that `--version` agrees with `VERSION`, and the blank-line rule.
-  Every other behaviour above was established by running the tool on a
-  real kernel tree, and no fixture checks any of it.
+Four defects, each pinned by an `expectedFailure` test in
+`test_kconfig_tree.py`. Such a test reports an unexpected success when its
+defect is fixed, and then has its decorator removed.
+
+- **No notice for an active option under a menu with nothing documented
+  yet.** The walk never enters a menu with no visible children, so the
+  "Active option not tracked" notice is raised only for options whose
+  menu already shows something. A kernel update that adds a menu with
+  options on by default says nothing about them.
+- **No warning when a value changes in the tool's own tree format.** The
+  merge rule says to warn on a value mismatch. The check reads only values
+  written in `.config` form (`CONFIG_A3=4096`), so after `[=4096]` becomes
+  `[=8192]` the glyph is updated without a warning.
+- **A vanished suppressed option loses its comment.** Its warning says it
+  was "converted to inline comment", but `write_suppressed` never writes
+  dead entries, so the rationale disappears from both files.
+- **The missing-occurrence warning cannot fire inside a menu.** An
+  `[if EXPR (N)]` the tree no longer has gets a two-level key
+  (`Menu::if EXPR (N)`), and occurrence tracking skips keys containing
+  `::`. It works only for `if` blocks at the top of the tree.
+
+The suite covers the behaviour documented above: comments, ordering,
+values, `--emit-kconfig`, notices, config columns, `--ascii`, suppression,
+conflicts, vanished symbols and `if` numbering. Every passing test has
+been seen to fail: eight single-line mutations of the tool each turned the
+intended test red. The folding of `[if SYM]` under its menuconfig and
+`--full` are not covered yet.
