@@ -617,14 +617,14 @@ _GLYPH_RE        = re.compile(r"^\[([^\]]*)\]")
 
 
 def _glyph_file_value(content: str) -> str:
-	"""The .config value a tree line's glyph records, or "" if none.
+	"""The .config value a tree line's glyph records: "n" for unset, or
+    "" when the line has no glyph and so records nothing.
 
     Column 1 is always the primary .config. A bool glyph keeps one
     character per column, so its first character is column 1. A value
     glyph lists its distinct values in column order, so the first is
     column 1's whenever column 1 has one; when it has none, the first
-    belongs to a later column, and the mismatch check skips an unset
-    .config value anyway.
+    may belong to a later column, which the mismatch check allows for.
     """
 	m = _GLYPH_RE.match(content)
 	if not m:
@@ -632,7 +632,9 @@ def _glyph_file_value(content: str) -> str:
 	inner = m.group(1)
 	if inner.startswith("="):
 		return inner[1:].split("/")[0]
-	return {"*": "y", "M": "m", "m": "m"}.get(inner[:1], "")
+	return {"*": "y", "M": "m", "m": "m"}.get(inner[:1], "n")
+
+
 _BARE_SYMBOL_RE  = re.compile(r"^(CONFIG_\w+)\s*(?:#.*)?$")
 _BARE_SYM_RE     = re.compile(r"^\w+$")  # single bare identifier
 _DOTCFG_SET_RE   = re.compile(r"^(CONFIG_\w+)=(.*)$")
@@ -1119,10 +1121,23 @@ class DocFileParser:
 				continue
 			live = (node.value or "").strip().strip('"')
 			fv   = entry.file_value.strip().strip('"')
-			if fv != live and fv not in ("", "n") and live not in ("", "n"):
-				self.warnings.append(
-                    f"Value mismatch for {sym}: "
-                    f"file has ={fv}, .config has ={live} - using .config value")
+			# "" and "n" are both unset. An option turned off or on is a
+			# change like any other, and the one most worth a warning.
+			if (fv or "n") == (live or "n"):
+				continue
+			if live in ("", "n") and fv not in ("y", "m", "n"):
+				# A value glyph lists distinct values only, so with column 1
+				# unset its first value may be another column's. Skip when
+				# one still has it; a bool glyph keeps a character per
+				# column, so it needs no such caution.
+				alt = {(a or "").strip().strip('"') for a in node.alt_values}
+				if fv in alt:
+					continue
+			def shown(v: str) -> str:
+				return "not set" if v in ("", "n") else f"={v}"
+			self.warnings.append(
+                f"Value mismatch for {sym}: file has {shown(fv)}, "
+                f".config has {shown(live)} - using .config value")
 
 
 # -- Comment indentation helpers -----------------------------------------------

@@ -87,9 +87,15 @@ carried a comment:
 A notice names every active option that neither file tracks, anywhere
 in the tree, including a menu with nothing documented yet. It is not
 given with `--add-new`, `--add-new-enabled` or `--full`, which add such
-options instead. A value in a tree line's glyph (`[*]`, `[M]`,
+options instead. A value in a tree line's glyph (`[*]`, `[M]`, `[ ]`,
 `[=4096]`) that differs from `.config` gets a "Value mismatch" warning
-once. The glyph is then rewritten, so the next run agrees.
+once, including an option turned off (`file has =y, .config has not
+set`) or turned on. The glyph is then rewritten, so the next run agrees.
+A bare `CONFIG_X` line has no glyph and records no value. One case is
+deliberately not warned about. With several configs, a value glyph lists
+distinct values only. So when `.config` turns off a value that another
+config still has (`[=8192]` over two columns), the listed value cannot be
+told apart from the other column's.
 
 The version is in `VERSION` and again in the script as
 `KCONFIG_TREE_VERSION`, because the script is vendored into kernel trees on
@@ -248,8 +254,3 @@ copies are theirs; this repository is where the tool itself changes.
   or `--full`. Everything else documented above has a test in
   `test_kconfig_tree.py`, and every passing test has been seen to fail
   under a one-line mutation of the tool.
-- **A value change to or from unset is not warned about.** The mismatch
-  check skips a value that is empty or `n` on either side, so a
-  documented `[*]` option that a kernel update turns off only has its
-  glyph changed. That was the rule before the value fix, and it is kept
-  until somebody decides otherwise.

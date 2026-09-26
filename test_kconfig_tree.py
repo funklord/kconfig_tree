@@ -219,6 +219,41 @@ class ValueTest(unittest.TestCase):
 		# Warned once: the rewritten glyph now agrees.
 		self.assertNotIn("Value mismatch", output(tree.run()))
 
+	# An option turned off or on is a change like any other, and the one
+	# most worth a warning; the check used to skip anything unset.
+	def test_option_turned_off_or_on_warns(self) -> None:
+		tree = KernelTree(self)
+		tree.run("--add-new")
+		self.assertIn("[ ] Alpha four (A4)", tree.read("kconfig_doc.txt"))
+		tree.write(".config", TREE_CONFIG
+		           .replace("CONFIG_A1=y\n", "")
+		           .replace("CONFIG_A3=4096\n", "")
+		           .replace("# CONFIG_A4 is not set", "CONFIG_A4=y"))
+		result = output(tree.run())
+		self.assertIn("Value mismatch for CONFIG_A1: file has =y, "
+		              ".config has not set", result)
+		self.assertIn("Value mismatch for CONFIG_A3: file has =4096, "
+		              ".config has not set", result)
+		self.assertIn("Value mismatch for CONFIG_A4: file has not set, "
+		              ".config has =y", result)
+		self.assertNotIn("Value mismatch", output(tree.run()))
+
+	# With .config unset, a value glyph's first value may be another
+	# column's; a bool glyph's first character is always .config's.
+	def test_two_column_unset_is_read_per_glyph_kind(self) -> None:
+		tree = KernelTree(self, config="CONFIG_A1=y\n")
+		tree.write(".config2", "CONFIG_A1=y\nCONFIG_A3=8192\n")
+		tree.write("kconfig_doc.txt", "CONFIG_A1\nCONFIG_A3\n")
+		tree.run()
+		doc = tree.read("kconfig_doc.txt")
+		self.assertIn("[**] Alpha one (A1)", doc)
+		self.assertIn("[=8192] Alpha three (A3)", doc)
+		self.assertNotIn("Value mismatch", output(tree.run()))
+		tree.write(".config", "")
+		result = output(tree.run())
+		self.assertIn("Value mismatch for CONFIG_A1: file has =y", result)
+		self.assertNotIn("CONFIG_A3", result)
+
 	# A two-column value glyph lists distinct values in column order, so
 	# .config's is the first: read as such it warns on a change there and
 	# on nothing else.
