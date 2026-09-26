@@ -1364,6 +1364,8 @@ class Merger:
 			all_dead += sup.dead_entries
 		self._anchor_map:   dict[str, list[RawEntry]] = {}
 		self._rootless_dead: list[RawEntry] = []
+		# Comments from folded [if SYM] lines, emitted under menuconfig SYM.
+		self._moved_comments: dict[str, list[CommentGroup]] = {}
 		for dead_entry in all_dead:
 			anchor = dead_entry.anchor_above_sym
 			if anchor:
@@ -1594,26 +1596,31 @@ class Merger:
 		children = node.children
 		for i, child in enumerate(children):
 			# Only fold when owning menuconfig is being emitted
-			if (_is_folded_if(child, node)
-                    and self._folded_if_owner(child, children) is not None):
-				# Warn if the user put a descriptive comment on this
-				# if-entry in the doc file - it will never be shown.
-				key = _struct_node_key(child)
-				_e  = self._eff_struct.get(key)
-				if _e and (_e.trailing_comment or _e.pre_group
-                           or any(not g.is_freestanding()
-                                  for g in _e.post_groups)):
-					# Find the owning menuconfig for the warning message
-					_mc = next((c for c in children
-                                if c.kind == "menuconfig"
-                                and c.name == child.prompt[3:].strip()),
-                               None)
-					_mc_name = _mc.name if _mc else "?"
+			owner = (self._folded_if_owner(child, children)
+                     if _is_folded_if(child, node) else None)
+			if owner is not None:
+				# A folded if-block has no line of its own, so comments on
+				# its line in doc move under the menuconfig it folds into:
+				# above, trailing, then below, freestanding ones keeping
+				# their blanks. They used to be dropped with a warning to
+				# move them, from a file already rewritten without them.
+				_e = self._eff_struct.get(_struct_node_key(child))
+				moved: list[CommentGroup] = []
+				if _e and _e.pre_group:
+					moved.append(CommentGroup(list(_e.pre_group.lines),
+                                              False, False))
+				if _e and _e.trailing_comment:
+					moved.append(CommentGroup([_e.trailing_comment],
+                                              False, False))
+				if _e:
+					moved += _e.post_groups
+				if moved:
+					self._moved_comments.setdefault(
+                            owner.symbol(), []).extend(moved)
 					self.warnings.append(
-                        f"Comment on [{child.occurrence_key}] in doc is "
-                        f"unreachable -- the if-block is folded under "
-                        f"menuconfig {_mc_name}; "
-                        f"move the comment to that menuconfig line")
+                        f"Comment on [{child.occurrence_key}] moved under "
+                        f"menuconfig {owner.name}, which its if-block "
+                        f"is folded into")
 				continue
 			if child.kind in ("config", "menuconfig"):
 				if self._should_emit(child):
@@ -1734,8 +1741,9 @@ class Merger:
                    _colour_line(node, prefix, connector, trailing, self.num_cols),
                    symbol=sym)
 
-		# Type-2 or type-4 post-comment
-		for g in (entry.post_groups if entry else []):
+		# Type-2 or type-4 post-comment, then any moved from a folded if
+		for g in ((entry.post_groups if entry else [])
+                  + self._moved_comments.pop(sym, [])):
 			self._emit_group(g, cmt_indent, is_pre=False)
 
 		# Dead entries anchored to this symbol (unknown symbols with comments)

@@ -506,21 +506,44 @@ class IfFoldingTest(unittest.TestCase):
 		              "CONFIG_NX1 is doc-tracked", result)
 		self.assertNotIn("NETX", tree.read("kconfig_doc_suppressed.txt"))
 
-	# A comment on a folded [if NETX] line cannot be shown, and the warning
-	# says to move it to the menuconfig line -- but the doc is rewritten in
-	# the same run, and the warning does not quote the comment, so by the
-	# time anybody reads it the comment is gone.
-	@unittest.expectedFailure
-	def test_comment_on_a_folded_if_block_is_not_lost(self) -> None:
+	# A folded if-block has no line of its own, so comments on its line
+	# move under the menuconfig. They used to be dropped, under a warning
+	# to move them from a file already rewritten without them.
+	def test_comment_on_a_folded_if_block_moves_to_the_menuconfig(
+	        self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt",
+		           "├[*] Net thing (NETX) -> # net why\n"
+		           "│├[if NETX] # why the block matters\n"
+		           "││# below the if\n"
+		           "\n"
+		           "# free note\n"
+		           "\n"
+		           "││└[*] Net one (NX1)\n")
+		result = output(tree.run())
+		self.assertIn("Comment on [if NETX] moved under menuconfig NETX",
+		              result)
+		want = [HEADER, "└[*] Net thing (NETX) -> # net why",
+		        " # why the block matters", " # below the if", "",
+		        "# free note", "", " └[*] Net one (NX1)"]
+		self.assertEqual(tree.read("kconfig_doc.txt").splitlines(), want)
+		self.assertNotIn("Comment on", output(tree.run()))
+		self.assertEqual(tree.read("kconfig_doc.txt").splitlines(), want)
+
+	# A comment above the if line, after a blank, belongs to the if line.
+	def test_comment_above_a_folded_if_block_moves_too(self) -> None:
 		tree = KernelTree(self)
 		tree.write("kconfig_doc.txt",
 		           "├[*] Net thing (NETX) ->\n"
-		           "│├[if NETX] # why the block matters\n"
+		           "\n"
+		           "││# above the if\n"
+		           "│├[if NETX] # on the if\n"
 		           "││└[*] Net one (NX1)\n")
-		result = output(tree.run())
-		self.assertIn("is unreachable", result)
-		self.assertIn("why the block matters",
-		              tree.read("kconfig_doc.txt") + result)
+		tree.run()
+		self.assertEqual(tree.read("kconfig_doc.txt").splitlines(),
+		                 [HEADER, "└[*] Net thing (NETX) ->",
+		                  " # above the if", " # on the if",
+		                  " └[*] Net one (NX1)"])
 
 
 class FullTest(unittest.TestCase):

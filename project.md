@@ -145,6 +145,9 @@ differ. The file format is the same however many columns there are.
 - **An `[if SYM]` block that follows a `menuconfig SYM` is folded** under
   that menuconfig in the doc file. The suppressed file always uses the flat
   Kconfig structure.
+  A folded block has no line of its own, so comments on its `[if SYM]`
+  line in doc move under the menuconfig line, text unchanged, with a
+  warning that names the move.
 
 ### Blank lines
 
@@ -250,15 +253,9 @@ copies are theirs; this repository is where the tool itself changes.
 
 ## Open
 
-- **A comment on a folded `[if SYM]` line is deleted.** It cannot be
-  shown, since the block is drawn under its menuconfig. The warning says
-  to move it to the menuconfig line, but the doc is rewritten in the same
-  run and the warning does not quote the comment, so the text is gone.
-  Pinned by an `expectedFailure` test.
-
-Everything documented above has a test in `test_kconfig_tree.py`, and
-every passing test has been seen to fail under a one-line mutation of
-the tool. One mutation cannot be observed at all: under `--full`,
-`prune_suppressed` clearing the suppressed index is redundant, because
-every known option is then in doc and the conflict pass removes it
-anyway.
+Nothing is known to be broken. Everything documented above has a test
+in `test_kconfig_tree.py`, and every passing test has been seen to fail
+under a one-line mutation of the tool. One mutation cannot be observed
+at all: under `--full`, `prune_suppressed` clearing the suppressed index
+is redundant, because every known option is then in doc and the
+conflict pass removes it anyway.
