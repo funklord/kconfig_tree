@@ -10,15 +10,15 @@ all:
 
 help:
 	@echo 'Targets:'
-	@echo '  check  style, then the gate'"'"'s own suite'
+	@echo '  check  style, then the tests'
 	@echo '  style  the indentation and whitespace gate'
 	@echo '  hooks  install the commit-msg hook from tool/hooks/'
 
 check: style test
 
-# The gate's suite travels with the gate. The tool itself has no tests yet;
-# see project.md.
+# The tool's own suite, then the gate's, which travels with the gate.
 test:
+	$(PYTHON) test_kconfig_tree.py
 	$(PYTHON) tool/test_style_gate.py
 
 # The indentation and whitespace gate, shared verbatim with the sibling

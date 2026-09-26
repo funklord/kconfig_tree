@@ -16,7 +16,8 @@ MERGE RULES
   In neither, active        -> notice on stderr (suggest --add-new-enabled)
   In both (conflict)        -> doc wins, warn, remove from suppressed
   --add-new                 -> add all symbols in neither file
-  --add-new-enabled         -> add only [*]/[M] symbols in neither file
+  --add-new-enabled [N]     -> add only [*]/[M] symbols in neither file,
+                               judged by config column N (default 1)
   --full                    -> merge suppressed->doc, add all remaining
 
 INPUT FORMATS ACCEPTED IN DOC / SUPPRESSED FILES
@@ -60,19 +61,27 @@ USAGE
 
 OPTIONS
 -------
+  A config column exists for each of .config, .config2 and .config3
+  that is present; the glyphs widen to one character per column.
+
   --kconfig    PATH   Top-level Kconfig file        (default: Kconfig)
   --dotconfig  PATH   Kernel .config file           (default: .config)
+  --dotconfig2 PATH   Second config, compared       (default: .config2)
+  --dotconfig3 PATH   Third config, compared        (default: .config3)
   --doc        PATH   Doc file                      (default: kconfig_doc.txt)
   --suppressed PATH   Suppressed file               (default: kconfig_doc_suppressed.txt)
   --arch       ARCH   Architecture                  (default: arm64)
   --add-new           Add all symbols in neither file to doc
-  --add-new-enabled   Add only active symbols in neither file to doc
+  --add-new-enabled [N]
+                      Add only symbols in neither file that are active
+                      in config column N (1-3, default 1) to doc
   --full              Restore suppressed + add all remaining symbols
   --emit-kconfig      Print Linux .config format to stdout, then exit
   --show              Show coloured tree on stdout
   --depth      N      Max tree depth (with --show)
   --filter     WORD   Show subtrees containing WORD (with --show)
   --no-color          Disable ANSI colours
+  --ascii             ASCII-only output: no UTF-8 box/glyph chars
   --no-doc            Do not write any files this run
 """
 

@@ -189,8 +189,8 @@ follows:
 
 ## Checks
 
-`make check` runs the shared style gate over the tree and the gate's own
-suite; `make hooks` installs the commit-msg hook. `tool/` holds verbatim
+`make check` runs the shared style gate over the tree, this tool's tests
+and the gate's own suite; `make hooks` installs the commit-msg hook. `tool/` holds verbatim
 copies from `claude-guidelines`, kept in step by its `sync.py`: fix them
 there, not here.
 
@@ -199,15 +199,13 @@ copies are theirs; this repository is where the tool itself changes.
 
 ## Open
 
-- **The module docstring is behind the argument parser.** Its OPTIONS list
-  omits `--dotconfig2`, `--dotconfig3` and `--ascii`. It is also printed as
-  the `--help` epilog, so `--help` shows the stale list.
 - **The blank-line rule has two descriptions.** A tool reference written on
   2026-06-03 said a blank goes before a node only when its structural
   parent's header was suppressed. The code (`_needs_blank`) and its
   docstring insert one between two config nodes that share no non-root
   ancestor. The code is newer, but which behaviour is intended has not been
   settled.
-- **No tests.** Every behaviour above was established by running the tool
-  on a real kernel tree, and no fixture checks any of it.
+- **Almost no tests.** `test_kconfig_tree.py` checks only that `--help`
+  lists every option. Every other behaviour above was established by
+  running the tool on a real kernel tree, and no fixture checks any of it.
 - **No `--version`.** The copyright line is in the README only.
