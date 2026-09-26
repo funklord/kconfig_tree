@@ -463,6 +463,98 @@ endmenu
 		              output(tree.run("--no-doc")))
 
 
+class IfFoldingTest(unittest.TestCase):
+	# "if NETX" directly after "menuconfig NETX" is drawn under the
+	# menuconfig in doc, which gains an expand marker when anything under
+	# it is visible.
+	def test_if_block_folds_under_its_menuconfig(self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_NETX\nCONFIG_NX1\n")
+		tree.run()
+		self.assertEqual(tree.read("kconfig_doc.txt").splitlines(),
+		                 [HEADER, "└[*] Net thing (NETX) ->",
+		                  " └[*] Net one (NX1)"])
+
+	# Folding happens only when the menuconfig is shown; otherwise the
+	# if-block is an ordinary header, so its children stay reachable.
+	def test_if_block_stays_visible_without_its_menuconfig(self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_NX1\n")
+		tree.run()
+		self.assertEqual(tree.read("kconfig_doc.txt").splitlines(),
+		                 [HEADER, "└[if NETX]", " └[*] Net one (NX1)"])
+
+	def test_no_marker_without_visible_children_and_flat_suppressed(
+	        self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_NETX\n")
+		tree.write("kconfig_doc_suppressed.txt", "CONFIG_NX1\n")
+		tree.run()
+		self.assertEqual(tree.read("kconfig_doc.txt").splitlines(),
+		                 [HEADER, "└[*] Net thing (NETX)"])
+		self.assertIn("[if NETX]", tree.read("kconfig_doc_suppressed.txt"))
+
+	# A folded if-block's children are the menuconfig's descendants, so
+	# the menuconfig cannot be suppressed while one of them is in doc.
+	def test_menuconfig_with_folded_child_in_doc_is_not_suppressed(
+	        self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_NX1\n")
+		tree.write("kconfig_doc_suppressed.txt", "CONFIG_NETX\n")
+		result = output(tree.run())
+		self.assertIn("Removed CONFIG_NETX from suppressed: descendant "
+		              "CONFIG_NX1 is doc-tracked", result)
+		self.assertNotIn("NETX", tree.read("kconfig_doc_suppressed.txt"))
+
+	# A comment on a folded [if NETX] line cannot be shown, and the warning
+	# says to move it to the menuconfig line -- but the doc is rewritten in
+	# the same run, and the warning does not quote the comment, so by the
+	# time anybody reads it the comment is gone.
+	@unittest.expectedFailure
+	def test_comment_on_a_folded_if_block_is_not_lost(self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt",
+		           "├[*] Net thing (NETX) ->\n"
+		           "│├[if NETX] # why the block matters\n"
+		           "││└[*] Net one (NX1)\n")
+		result = output(tree.run())
+		self.assertIn("is unreachable", result)
+		self.assertIn("why the block matters",
+		              tree.read("kconfig_doc.txt") + result)
+
+
+class FullTest(unittest.TestCase):
+	# --full restores everything suppressed, with its comments, and adds
+	# every remaining option; the suppressed file is emptied.
+	def test_full_merges_suppressed_and_adds_the_rest(self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_A1 # one why\n")
+		tree.write("kconfig_doc_suppressed.txt",
+		           "CONFIG_A2 # two why\nCONFIG_A4 # four why\n")
+		result = output(tree.run("--full"))
+		doc = tree.read("kconfig_doc.txt")
+		for line in ("(A1) # one why", "(A2) # two why", "(A4) # four why",
+		             "(A3)", "(NETX)", "(NX1)", "(B1)", "(B2)"):
+			self.assertIn(line, doc)
+		self.assertEqual(tree.read("kconfig_doc_suppressed.txt"), "")
+		# Restored options are not new; only the ones neither file had.
+		self.assertIn("New option added to doc: CONFIG_B2", result)
+		self.assertNotIn("added to doc: CONFIG_A2", result)
+		self.assertNotIn("added to doc: CONFIG_A4", result)
+		# And the result is a fixed point for ordinary runs.
+		tree.run()
+		self.assertEqual(tree.read("kconfig_doc.txt"), doc)
+
+	def test_full_moves_a_suppressed_stub_into_doc(self) -> None:
+		tree = KernelTree(self)
+		tree.write("kconfig_doc.txt", "CONFIG_A1\n")
+		tree.write("kconfig_doc_suppressed.txt",
+		           "CONFIG_A2\n# CONFIG_GONE # gone why\n")
+		tree.run("--full")
+		self.assertIn("# CONFIG_GONE # gone why", tree.read("kconfig_doc.txt"))
+		self.assertEqual(tree.read("kconfig_doc_suppressed.txt"), "")
+
+
 class VersionTest(unittest.TestCase):
 	# The number lives in the VERSION file and, because the script travels
 	# alone into the trees that vendor it, again in the script. Asked of

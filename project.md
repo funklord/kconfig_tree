@@ -250,7 +250,15 @@ copies are theirs; this repository is where the tool itself changes.
 
 ## Open
 
-- **Tests do not cover** the folding of `[if SYM]` under its menuconfig,
-  or `--full`. Everything else documented above has a test in
-  `test_kconfig_tree.py`, and every passing test has been seen to fail
-  under a one-line mutation of the tool.
+- **A comment on a folded `[if SYM]` line is deleted.** It cannot be
+  shown, since the block is drawn under its menuconfig. The warning says
+  to move it to the menuconfig line, but the doc is rewritten in the same
+  run and the warning does not quote the comment, so the text is gone.
+  Pinned by an `expectedFailure` test.
+
+Everything documented above has a test in `test_kconfig_tree.py`, and
+every passing test has been seen to fail under a one-line mutation of
+the tool. One mutation cannot be observed at all: under `--full`,
+`prune_suppressed` clearing the suppressed index is redundant, because
+every known option is then in doc and the conflict pass removes it
+anyway.
