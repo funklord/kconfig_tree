@@ -122,6 +122,26 @@ differ. The file format is the same however many columns there are.
   that menuconfig in the doc file. The suppressed file always uses the flat
   Kconfig structure.
 
+### Blank lines
+
+The tree connectors carry the hierarchy, so the tool inserts no blank line
+between options, even where consecutive options come from unrelated
+subtrees. Blank lines in the output come only from comments of types 3
+and 4, which keep the blanks around them. Settled 2026-09-26 by keeping
+what the code does. `test_kconfig_tree.py` pins it with two menus whose
+options must meet with no blank line between them.
+
+The record had this wrong twice, which is why the measurement is here.
+`_needs_blank()` inserted a blank between options that share no non-root
+ancestor. It lost its only caller in revision 14 but stayed in the file,
+and the module docstring went on describing it as the rule. It has been
+deleted. The Merger also has a check that inserts a blank before an option
+whose parent header was not printed. Since revision 36, headers cannot be
+suppressed, so that check no longer fires: across 1065 options on a real
+kernel doc it held for none, while the same probe with its condition
+removed fired for all of them. It is kept in case headers become hideable
+again.
+
 ### Comments
 
 Four kinds, and each one travels with its anchor node wherever the tool
@@ -206,13 +226,7 @@ copies are theirs; this repository is where the tool itself changes.
 
 ## Open
 
-- **The blank-line rule has two descriptions.** A tool reference written on
-  2026-06-03 said a blank goes before a node only when its structural
-  parent's header was suppressed. The code (`_needs_blank`) and its
-  docstring insert one between two config nodes that share no non-root
-  ancestor. The code is newer, but which behaviour is intended has not been
-  settled.
-- **Almost no tests.** `test_kconfig_tree.py` checks only that `--help`
-  lists every option and that `--version` agrees with `VERSION`. Every
-  other behaviour above was established by running the tool on a real
-  kernel tree, and no fixture checks any of it.
+- **Few tests.** `test_kconfig_tree.py` checks that `--help` lists every
+  option, that `--version` agrees with `VERSION`, and the blank-line rule.
+  Every other behaviour above was established by running the tool on a
+  real kernel tree, and no fixture checks any of it.

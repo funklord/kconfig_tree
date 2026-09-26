@@ -43,10 +43,14 @@ FOUR COMMENT TYPES
                       both surrounding blanks preserved
                       blanks between lines in the group collapsed to one
 
-ORPHAN SPACING
---------------
-  A blank line is inserted between two config/menuconfig nodes from
-  completely different subtrees so the tree cannot be visually misread.
+BLANK LINES
+-----------
+  The tree connectors show the hierarchy, so no blank line is inserted
+  between options, even where they come from unrelated subtrees. Blank
+  lines come only from the comments that carry them (types 3 and 4).
+  A blank is also inserted before an option whose parent menu, choice
+  or if-block header was not printed; since headers can no longer be
+  suppressed, that does not happen in practice.
 
 USAGE
 -----
@@ -1079,29 +1083,6 @@ class DocFileParser:
                     f"file has ={fv}, .config has ={live} - using .config value")
 
 
-# -- Ancestry / orphan-blank ---------------------------------------------------
-
-def _needs_blank(prev_node: Optional[KNode], curr_node: KNode) -> bool:
-	"""
-    True when a blank should be inserted between prev and curr because
-    they come from completely different subtrees.
-    Only fires for config/menuconfig nodes - structural nodes never set
-    prev_node, so they can't trigger orphan blanks.
-    """
-	if prev_node is None:
-		return False
-	if prev_node.kind not in ("config", "menuconfig"):
-		return False
-	if curr_node.kind not in ("config", "menuconfig"):
-		return False
-	prev_anc = set(id(n) for n in prev_node.ancestry())
-	curr_anc = set(id(n) for n in curr_node.ancestry())
-	shared = prev_anc & curr_anc
-	non_root_shared = [n for n in prev_node.ancestry() + curr_node.ancestry()
-                       if id(n) in shared and n.parent is not None]
-	return len(non_root_shared) == 0
-
-
 # -- Comment indentation helpers -----------------------------------------------
 
 
@@ -1638,6 +1619,10 @@ class Merger:
 		#  2. we are seeing a NEW parent group (not a sibling of the previous node)
 		# In a normal tree render connectors make hierarchy clear - blanks are
 		# only needed when suppression has broken the visual parent-child chain.
+		# Structural headers stopped being suppressible in revision 36, so
+		# this no longer fires: measured over 1065 emitted options on a real
+		# kernel doc, it held for none. Kept for if headers become hideable
+		# again; the rule the tool follows is in the BLANK LINES docstring.
 		parent = node.parent
 		parent_suppressed = (
             parent is not None
