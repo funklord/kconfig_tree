@@ -3,7 +3,7 @@
 
 PYTHON ?= python3
 
-.PHONY: all check test style style-source style-docs hooks help
+.PHONY: all check test style style-source style-tool style-docs hooks help
 
 all:
 	@:
@@ -23,7 +23,15 @@ test:
 
 # The indentation and whitespace gate, shared verbatim with the sibling
 # projects; `docs` additionally holds project.md to the tree it describes.
-style: style-source style-docs
+style: style-tool style-source style-docs
+
+# The style gate's own suite, run ahead of the gate's verdict. A checker
+# that has stopped inspecting anything passes exactly as loudly as one
+# that works, so its pass is worth reading only once its suite has.
+# tool/test_style_gate.py arrives beside tool/style_gate.py and was
+# carried here unrun until 2026-11-12, on the holder's word.
+style-tool:
+	$(PYTHON) tool/test_style_gate.py
 
 style-source:
 	$(PYTHON) tool/style_gate.py check
